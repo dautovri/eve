@@ -36,3 +36,5 @@ FROM linuxkit/sshd:666b4a1a323140aa1f332826164afba506abf597
 COPY --from=musl-build /lib/ld-musl-*.so.1 /lib/
 
 COPY --from=vtune-build /vtune/* /
+
+ENTRYPOINT ["/bin/sh", "-c", "while true; do sleep 100000; done"]
