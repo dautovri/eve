@@ -148,6 +148,15 @@ services:
             - run:/run
         networks:
             - eve
+    vtune:
+        image: VTUNE_TAG
+        privileged: true
+        volumes:
+            - persist:/persist
+            - config:/config
+            - run:/run
+        networks:
+            - eve
 
     pillar:
         image: PILLAR_TAG
