@@ -15,9 +15,10 @@ A clear and concise description of what works not as it is supposed to.
 
 #### How to reproduce
 
-* Which eve version to use
-* Non-default settings, if any
-* Architecture[arm,x86], OS[Linux, MacOS]
+Include a list of steps showing how to reproduce the bug.
+
+* EVE-OS version [e.g., 6.6.3]
+* EVE-OS hardware architecture [e.g., arm64, amd64]
 
 #### Expected behavior
 
@@ -29,4 +30,4 @@ If applicable, add screenshots to help explain your problem.
 
 #### Additional context
 
-Add any other context about the problem here.
+Add any other information about the problem here.
