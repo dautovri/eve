@@ -317,6 +317,8 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	aclMetric.TotalRuleCount = networkMetrics.TotalRuleCount
 	ReportDeviceMetric.Acl = aclMetric
 
+	ReportDeviceMetric.Cellular = getCellularMetrics(ctx)
+
 	zedboxStats := new(metrics.ZedboxStats)
 	zedboxStats.NumGoRoutines = uint32(runtime.NumGoroutine()) // number of zedbox goroutines
 	ReportDeviceMetric.Zedbox = zedboxStats
@@ -534,17 +536,6 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	ReportDeviceMetric.RuntimeStorageOverheadMB = runtimeStorageOverhead
 	ReportDeviceMetric.AppRunTimeStorageMB = appRunTimeStorage
 
-	// Note that these are associated with the device and not with a
-	// device name like ppp0 or wwan0
-	lte := readLTEMetrics()
-	for _, i := range lte {
-		item := new(metrics.MetricItem)
-		item.Key = i.Key
-		item.Type = metrics.MetricItemType(i.Type)
-		setMetricAnyValue(item, i.Value)
-		ReportDeviceMetric.MetricItems = append(ReportDeviceMetric.MetricItems, item)
-	}
-
 	const nanoSecToSec uint64 = 1000000000
 
 	// Get device info using nil UUID
@@ -624,6 +615,15 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 				ctx.getconfigCtx.lastProcessedConfig, err)
 		}
 	}
+
+	// Report flowlog metrics.
+	ctx.flowLogMetrics.Lock()
+	ReportDeviceMetric.Flowlog = &metrics.FlowlogMetric{
+		Messages:    protoEncodeFlowlogCounters(ctx.flowLogMetrics.Messages),
+		Flows:       protoEncodeFlowlogCounters(ctx.flowLogMetrics.Flows),
+		DnsRequests: protoEncodeFlowlogCounters(ctx.flowLogMetrics.DNSReqs),
+	}
+	ctx.flowLogMetrics.Unlock()
 
 	ReportMetrics.MetricContent = new(metrics.ZMetricMsg_Dm)
 	if x, ok := ReportMetrics.GetMetricContent().(*metrics.ZMetricMsg_Dm); ok {
@@ -819,6 +819,48 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 		cms = zedcloud.Append(cms, zedagentMetrics)
 		ctx.pubMetricsMap.Publish("global", cms)
 	}
+}
+
+func getCellularMetrics(ctx *zedagentContext) (cellularMetrics []*metrics.CellularMetric) {
+	m, err := ctx.subWwanMetrics.Get("global")
+	if err != nil {
+		log.Errorf("subWwanMetrics.Get failed: %v", err)
+		return
+	}
+	wwanMetrics, ok := m.(types.WwanMetrics)
+	if !ok {
+		log.Errorln("unexpected type of wwan metrics")
+		return
+	}
+	for _, network := range wwanMetrics.Networks {
+		if network.LogicalLabel == "" {
+			// skip unmanaged modems for now
+			continue
+		}
+		cellularMetrics = append(cellularMetrics,
+			&metrics.CellularMetric{
+				Logicallabel: network.LogicalLabel,
+				SignalStrength: &metrics.CellularSignalStrength{
+					Rssi: network.SignalInfo.RSSI,
+					Rsrq: network.SignalInfo.RSRQ,
+					Rsrp: network.SignalInfo.RSRP,
+					Snr:  network.SignalInfo.SNR,
+				},
+				PacketStats: &metrics.CellularPacketStats{
+					Rx: &metrics.NetworkStats{
+						TotalPackets: network.PacketStats.RxPackets,
+						Drops:        network.PacketStats.RxDrops,
+						TotalBytes:   network.PacketStats.RxBytes,
+					},
+					Tx: &metrics.NetworkStats{
+						TotalPackets: network.PacketStats.TxPackets,
+						Drops:        network.PacketStats.TxDrops,
+						TotalBytes:   network.PacketStats.TxBytes,
+					},
+				},
+			})
+	}
+	return cellularMetrics
 }
 
 func getDiskInfo(ctx *zedagentContext, vrs types.VolumeRefStatus, appDiskDetails *metrics.AppDiskMetric) error {
@@ -1527,4 +1569,12 @@ func protoEncodeNetworkInstanceMetricProto(status types.NetworkInstanceMetrics) 
 	}
 
 	return metric
+}
+
+func protoEncodeFlowlogCounters(counters types.FlowlogCounters) *metrics.FlowlogCounters {
+	return &metrics.FlowlogCounters{
+		Success:        counters.Success,
+		Drops:          counters.Drops,
+		FailedAttempts: counters.FailedAttempts,
+	}
 }

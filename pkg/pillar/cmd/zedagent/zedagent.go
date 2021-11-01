@@ -87,6 +87,7 @@ type DNSContext struct {
 	triggerGetConfig       bool
 	triggerDeviceInfo      bool
 	triggerHandleDeferred  bool
+	triggerRadioPOST       bool
 }
 
 type zedagentContext struct {
@@ -123,6 +124,8 @@ type zedagentContext struct {
 	subAppDiskMetric          pubsub.Subscription
 	subCapabilities           pubsub.Subscription
 	subAppInstMetaData        pubsub.Subscription
+	subWwanMetrics            pubsub.Subscription
+	subDeviceNetworkStatus    pubsub.Subscription
 	rebootCmd                 bool
 	rebootCmdDeferred         bool
 	deviceReboot              bool
@@ -145,6 +148,7 @@ type zedagentContext struct {
 	globalConfig            types.ConfigItemValueMap
 	specMap                 types.ConfigItemSpecMap
 	globalStatus            types.GlobalStatus
+	flowLogMetrics          types.FlowlogMetrics
 	appContainerStatsTime   time.Time // last time the App Container stats uploaded
 	// The MaintenanceMode can come from GlobalConfig and from the config
 	// API. Those are merged into maintenanceMode
@@ -288,7 +292,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	initializeDirs()
 
 	// Context to pass around
-	getconfigCtx := getconfigContext{}
+	getconfigCtx := getconfigContext{localServerMap: &localServerMap{}}
 	cipherCtx := cipherContext{}
 	attestCtx := attestContext{}
 
@@ -306,6 +310,19 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 
 	attestCtx.zedagentCtx = &zedagentCtx
 	zedagentCtx.attestCtx = &attestCtx
+
+	pubZedAgentStatus, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.ZedAgentStatus{},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	pubZedAgentStatus.ClearRestarted()
+	getconfigCtx.pubZedAgentStatus = pubZedAgentStatus
+
+	// apply saved radio config ASAP
+	initializeRadioConfig(&getconfigCtx)
 
 	// Wait until we have been onboarded aka know our own UUID
 	subOnboardStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -439,15 +456,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	pubBaseOs.ClearRestarted()
 	getconfigCtx.pubBaseOs = pubBaseOs
 
-	pubZedAgentStatus, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName: agentName,
-		TopicType: types.ZedAgentStatus{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	pubZedAgentStatus.ClearRestarted()
-	getconfigCtx.pubZedAgentStatus = pubZedAgentStatus
 	pubDatastoreConfig, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
 		TopicType: types.DatastoreConfig{},
@@ -860,6 +868,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 		log.Fatal(err)
 	}
 	DNSctx.subDeviceNetworkStatus = subDeviceNetworkStatus
+	zedagentCtx.subDeviceNetworkStatus = subDeviceNetworkStatus
 	subDeviceNetworkStatus.Activate()
 
 	subDevicePortConfigList, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -989,6 +998,21 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	zedagentCtx.subAppInstMetaData = subAppInstMetaData
 	subAppInstMetaData.Activate()
 
+	subWwanMetrics, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "nim",
+		MyAgentName: agentName,
+		TopicImpl:   types.WwanMetrics{},
+		Activate:    false,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedagentCtx.subWwanMetrics = subWwanMetrics
+	subWwanMetrics.Activate()
+
 	//initialize cipher processing block
 	cipherModuleInitialize(&zedagentCtx, ps)
 
@@ -1082,7 +1106,11 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			subEncryptedKeyFromDevice.ProcessChange(change)
 
 		case change := <-getconfigCtx.subAppNetworkStatus.MsgChan():
+			getconfigCtx.localServerMap.upToDate = false
 			subAppNetworkStatus.ProcessChange(change)
+
+		case change := <-subWwanMetrics.MsgChan():
+			subWwanMetrics.ProcessChange(change)
 
 		case change := <-deferredChan:
 			start := time.Now()
@@ -1259,6 +1287,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 	localProfileTickerHandle := <-handleChannel
 	getconfigCtx.localProfileTickerHandle = localProfileTickerHandle
 
+	// start task fetching radio config from local server
+	go radioPOSTTask(&getconfigCtx)
+
 	// start cipher module tasks
 	cipherModuleStart(&zedagentCtx)
 
@@ -1304,6 +1335,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 			subNodeAgentStatus.ProcessChange(change)
 
 		case change := <-getconfigCtx.subAppNetworkStatus.MsgChan():
+			getconfigCtx.localServerMap.upToDate = false
 			subAppNetworkStatus.ProcessChange(change)
 
 		case change := <-subDeviceNetworkStatus.MsgChan():
@@ -1323,6 +1355,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 				zedcloud.HandleDeferred(zedcloudCtx, start, 100*time.Millisecond, false)
 				ps.CheckMaxTimeTopic(agentName, "deferredChan", start, warningTime, errorTime)
 				DNSctx.triggerHandleDeferred = false
+			}
+			if DNSctx.triggerRadioPOST {
+				triggerRadioPOST(&getconfigCtx)
+				DNSctx.triggerRadioPOST = false
 			}
 
 		case change := <-subAssignableAdapters.MsgChan():
@@ -1496,6 +1532,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject) in
 
 		case change := <-subAppInstMetaData.MsgChan():
 			subAppInstMetaData.ProcessChange(change)
+
+		case change := <-subWwanMetrics.MsgChan():
+			subWwanMetrics.ProcessChange(change)
 
 		case <-stillRunning.C:
 			// Fault injection
@@ -1695,6 +1734,11 @@ func handleDNSImpl(ctxArg interface{}, key string,
 	if status.State == types.DPC_SUCCESS && deviceNetworkStatus.State != types.DPC_SUCCESS {
 		ctx.triggerHandleDeferred = true
 	}
+	if deviceNetworkStatus.RadioSilence.ChangeInProgress &&
+		!status.RadioSilence.ChangeInProgress {
+		// radio-silence state changing operation has just finalized
+		ctx.triggerRadioPOST = true
+	}
 	log.Functionf("handleDNSImpl: changed %v",
 		cmp.Diff(*deviceNetworkStatus, status))
 	*deviceNetworkStatus = status
@@ -1704,6 +1748,7 @@ func handleDNSImpl(ctxArg interface{}, key string,
 	if zedcloudCtx.V2API {
 		zedcloud.UpdateTLSProxyCerts(zedcloudCtx)
 	}
+
 	log.Functionf("handleDNSImpl done for %s", key)
 }
 
@@ -1837,7 +1882,7 @@ func handleGlobalConfigImpl(ctxArg interface{}, key string,
 	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(log, ctx.subGlobalConfig, agentName,
 		debugOverride, logger)
-	if gcp != nil && !ctx.GCInitialized {
+	if gcp != nil {
 		ctx.globalConfig = *gcp
 		ctx.GCInitialized = true
 		ctx.gcpMaintenanceMode = gcp.GlobalValueTriState(types.MaintenanceMode)
