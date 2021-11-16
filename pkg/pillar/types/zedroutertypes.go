@@ -1518,6 +1518,9 @@ func getLocalAddrImpl(globalStatus DeviceNetworkStatus, pickNum int,
 		return net.IP{}, err
 	}
 	numAddrs := len(addrs)
+	if numAddrs == 0 {
+		return net.IP{}, fmt.Errorf("no addresses")
+	}
 	pickNum = pickNum % numAddrs
 	return addrs[pickNum], nil
 }
@@ -2018,6 +2021,9 @@ type NetworkInstanceInfo struct {
 	VlanMap map[uint32]uint32
 	// Counts the number of trunk ports attached to this network instance
 	NumTrunkPorts uint32
+
+	// IP address on which the meta-data server listens
+	MetaDataServerIP string
 }
 
 func (instanceInfo *NetworkInstanceInfo) IsVifInBridge(
