@@ -25,7 +25,7 @@ jobs:
           make V=1 pkgs
           COMMIT_ID=$(git describe --abbrev=8 --always)
           echo "VERSION=0.0.0-pr$PR_ID-$COMMIT_ID" >> $GITHUB_ENV
-          echo "TAG=evebuild/danger:pr$PR_ID" >> $GITHUB_ENV
+          echo "TAG=evebuild/publish_pr_build:pr$PR_ID" >> $GITHUB_ENV
       - name: Build EVE for Xen
         run: |
           make V=1 ROOTFS_VERSION="$VERSION" HV=xen eve

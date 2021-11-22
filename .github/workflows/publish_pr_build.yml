@@ -71,16 +71,27 @@ jobs:
         run: |
           wget -O eve-arm64.zip "${{steps.find-pr-artifact-arm64.outputs.result}}"
 
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish EVE
         run: |
-          echo "${{ secrets.DOCKERHUB_TOKEN }}" |\
-             docker login -u evebuild --password-stdin
-
           for arch in amd64 arm64; do
              rm -f eve.tar
              unzip "eve-$arch.zip"
              for i in `docker load < eve.tar | sed -e 's#^Loaded image:##'`; do
                 docker push "$i"
+                docker push ghcr.io/"$i"
                 IMGS="$IMGS ${i/-$arch/}"
              done
           done
@@ -88,4 +99,5 @@ jobs:
           for i in $(echo "$IMGS" | tr ' ' '\012' | sort -u); do
              docker manifest create "$i" --amend "$i-arm64" --amend "$i-amd64"
              docker manifest push "$i"
+             docker manifest push ghcr.io/"$i"
           done
