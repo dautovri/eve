@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [arm64-dirty, ubuntu-20.04]
+        os: [ubuntu-20.04]
     steps:
       - uses: actions/checkout@v2
         with:
