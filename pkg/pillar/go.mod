@@ -7,8 +7,8 @@ require (
 	github.com/Focinfi/go-dns-resolver v1.0.1
 	github.com/anatol/smart.go v0.0.0-20220615232124-371056cd18c3
 	github.com/bicomsystems/go-libzfs v0.4.0
-	github.com/containerd/cgroups v1.0.3
-	github.com/containerd/containerd v1.6.12
+	github.com/containerd/cgroups v1.0.4
+	github.com/containerd/containerd v1.6.18
 	github.com/containerd/typeurl v1.0.2
 	github.com/cshari-zededa/eve-tpm2-tools v0.0.4
 	github.com/digitalocean/go-libvirt v0.0.0-20221020193630-0d0212f5ead2 // indirect
