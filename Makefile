@@ -12,7 +12,7 @@ uniq = $(if $1,$(firstword $1) $(call uniq,$(filter-out $(firstword $1),$1)))
 
 # you are not supposed to tweak these variables -- they are effectively R/O
 HV_DEFAULT=kvm
-GOVER ?= 1.19.2
+GOVER ?= 1.20.1
 PKGBASE=github.com/lf-edge/eve
 GOMODULE=$(PKGBASE)/pkg/pillar
 GOTREE=$(CURDIR)/pkg/pillar
@@ -35,21 +35,23 @@ HV=$(HV_DEFAULT)
 # Enable development build (disabled by default)
 DEV=n
 # How large to we want the disk to be in Mb
-MEDIA_SIZE=8192
+MEDIA_SIZE=32768
 # Image type for final disk images
 IMG_FORMAT=qcow2
 # Filesystem type for rootfs image
 ROOTFS_FORMAT=squash
 # Image type for installer image
 INSTALLER_IMG_FORMAT=raw
+# Image type for verification image
+VERIFICATION_IMG_FORMAT=raw
 # SSH port to use for running images live
 SSH_PORT=2222
 # ports to proxy into a running EVE instance (in ssh notation with -L)
 SSH_PROXY=-L6000:localhost:6000
 # ssh key to be used for getting into an EVE instance
 SSH_KEY=$(CONF_DIR)/ssh.key
-# Use QEMU H/W accelearation (any non-empty value will trigger using it)
-ACCEL=
+# Disable QEMU H/W acceleration (any non-empty value will trigger using it)
+NOACCEL=
 # Use TPM device (any non-empty value will trigger using it), i.e. 'make TPM=y run'
 TPM=
 # Prune dangling images after build of package to reduce disk usage (any non-empty value will trigger using it)
@@ -116,12 +118,14 @@ LIVE=$(BUILD_DIR)/live
 LIVE_IMG=$(BUILD_DIR)/live.$(IMG_FORMAT)
 TARGET_IMG=$(BUILD_DIR)/target.img
 INSTALLER=$(BUILD_DIR)/installer
+VERIFICATION=$(BUILD_DIR)/verification
 BUILD_DIR=$(DIST)/$(ROOTFS_VERSION)
 CURRENT_DIR=$(DIST)/current
 CURRENT_IMG=$(CURRENT_DIR)/live.$(IMG_FORMAT)
 CURRENT_SWTPM=$(CURRENT_DIR)/swtpm
 CURRENT_INSTALLER=$(CURRENT_DIR)/installer
 INSTALLER_IMG=$(INSTALLER).$(INSTALLER_IMG_FORMAT)
+VERIFICATION_IMG=$(VERIFICATION).$(VERIFICATION_IMG_FORMAT)
 INSTALLER_FIRMWARE_DIR=$(INSTALLER)/firmware
 CURRENT_FIRMWARE_DIR=$(CURRENT_INSTALLER)/firmware
 UBOOT_IMG=$(INSTALLER_FIRMWARE_DIR)/boot
@@ -147,6 +151,7 @@ ROOTFS_TAR=$(BUILD_DIR)/rootfs.tar
 CONFIG_IMG=$(INSTALLER)/config.img
 INITRD_IMG=$(INSTALLER)/initrd.img
 INSTALLER_IMG=$(INSTALLER)/installer.img
+VERIFICATION_IMG=$(INSTALLER)/verification.img
 PERSIST_IMG=$(INSTALLER)/persist.img
 KERNEL_IMG=$(INSTALLER)/kernel
 IPXE_IMG=$(INSTALLER)/ipxe.efi
@@ -154,8 +159,8 @@ EFI_PART=$(INSTALLER)/EFI
 BOOT_PART=$(INSTALLER)/boot
 BSP_IMX_PART=$(INSTALLER)/bsp-imx
 
-SBOM=$(ROOTFS).spdx.json
-
+SBOM?=$(ROOTFS).spdx.json
+COLLECTED_SOURCES=$(BUILD_DIR)/collected_sources.tar.gz
 DEVICETREE_DTB_amd64=
 DEVICETREE_DTB_arm64=$(DIST)/dtb/eve.dtb
 DEVICETREE_DTB=$(DEVICETREE_DTB_$(ZARCH))
@@ -189,6 +194,11 @@ QEMU_SYSTEM_amd64=qemu-system-x86_64
 QEMU_SYSTEM_riscv64=qemu-system-riscv64
 QEMU_SYSTEM=$(QEMU_SYSTEM_$(ZARCH))
 
+ifeq ($(NOACCEL),)
+ACCEL=1
+else
+ACCEL=
+endif
 QEMU_ACCEL_Y_Darwin_amd64=-machine q35,accel=hvf,usb=off -cpu kvm64,kvmclock=off
 QEMU_ACCEL_Y_Linux_amd64=-machine q35,accel=kvm,usb=off,dump-guest-core=off -cpu host,invtsc=on,kvmclock=off -machine kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on,aw-bits=48
 # -machine virt,gic_version=3
@@ -225,7 +235,9 @@ QEMU_OPTS_COMMON= -m $(QEMU_MEMORY) -smp 4 -display none $(QEMU_OPTS_BIOS) \
 	-global ICH9-LPC.noreboot=false -watchdog-action reset \
         -rtc base=utc,clock=rt \
         -netdev user,id=eth0,net=$(QEMU_OPTS_NET1),dhcpstart=$(QEMU_OPTS_NET1_FIRST_IP),hostfwd=tcp::$(SSH_PORT)-:22$(QEMU_TFTP_OPTS) -device virtio-net-pci,netdev=eth0,romfile="" \
-        -netdev user,id=eth1,net=$(QEMU_OPTS_NET2),dhcpstart=$(QEMU_OPTS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile=""
+        -netdev user,id=eth1,net=$(QEMU_OPTS_NET2),dhcpstart=$(QEMU_OPTS_NET2_FIRST_IP) -device virtio-net-pci,netdev=eth1,romfile="" \
+        -device nec-usb-xhci,id=xhci \
+        -qmp unix:$(CURDIR)/qmp.sock,server,wait=off
 QEMU_OPTS_CONF_PART=$(shell [ -d "$(CONF_PART)" ] && echo '-drive file=fat:rw:$(CONF_PART),format=raw')
 QEMU_OPTS=$(QEMU_OPTS_COMMON) $(QEMU_ACCEL) $(QEMU_OPTS_$(ZARCH)) $(QEMU_OPTS_CONF_PART) $(QEMU_OPTS_TPM)
 # -device virtio-blk-device,drive=image -drive if=none,id=image,file=X
@@ -261,7 +273,7 @@ endif
 
 DOCKER_GO = _() { $(SET_X); mkdir -p $(CURDIR)/.go/src/$${3:-dummy} ; mkdir -p $(CURDIR)/.go/bin ; \
     docker_go_line="docker run $$DOCKER_GO_ARGS -i --rm -u $(USER) -w /go/src/$${3:-dummy} \
-    -v $(CURDIR)/.go:/go -v $$2:/go/src/$${3:-dummy} -v $${4:-$(CURDIR)/.go/bin}:/go/bin -v $(CURDIR)/:/eve -v $${HOME}:/home/$(USER) \
+    -v $(CURDIR)/.go:/go:z -v $$2:/go/src/$${3:-dummy}:z -v $${4:-$(CURDIR)/.go/bin}:/go/bin:z -v $(CURDIR)/:/eve:z -v $${HOME}:/home/$(USER):z \
     -e GOOS -e GOARCH -e CGO_ENABLED -e BUILD=local $(GOBUILDER) bash --noprofile --norc -c" ; \
     verbose=$(V) ;\
     verbose=$${verbose:-0} ;\
@@ -279,7 +291,13 @@ RESCAN_DEPS=FORCE
 # set FORCE_BUILD to --force to enforce rebuild
 FORCE_BUILD=
 
-SYFT_VERSION:=v0.63.0
+# for the go build sources
+GOSOURCES=$(BUILDTOOLS_BIN)/go-sources-and-licenses
+GOSOURCES_VERSION=c73009667f4871c084c1f2164063321c81d053a2
+GOSOURCES_SOURCE=github.com/deitch/go-sources-and-licenses
+
+
+SYFT_VERSION:=v0.78.0
 SYFT_IMAGE:=docker.io/anchore/syft:$(SYFT_VERSION)
 
 # we use the following block to assign correct tag to the Docker registry artifact
@@ -316,7 +334,7 @@ PKGS=pkg/alpine $(PKGS_$(ZARCH))
 
 # these are the packages that, when built, also need to be loaded into docker
 # if you need a pkg to be loaded into docker, in addition to the lkt cache, add it here
-PKGS_DOCKER_LOAD=mkconf mkimage-iso-efi mkimage-raw-efi mkrootfs-ext4 mkrootfs-squash
+PKGS_DOCKER_LOAD=mkconf mkimage-iso-efi mkimage-raw-efi mkverification-raw-efi mkrootfs-ext4 mkrootfs-squash
 # these packages should exists for HOSTARCH as well as for ZARCH
 # alpine-base, alpine and cross-compilers are dependencies for others
 PKGS_HOSTARCH=alpine-base alpine cross-compilers $(PKGS_DOCKER_LOAD)
@@ -343,7 +361,11 @@ currentversion:
 	@cat $(CURRENT_DIR)/installer/eve_version
 
 
-.PHONY: currentversion linuxkit
+kernel-yml:
+	$(QUIET)if [ ! -f "pkg/kernel/build.yml" ] || [ ! -f "pkg/new-kernel/build.yml" ]; then tools/kernel-build-yml.sh; fi
+
+
+.PHONY: currentversion linuxkit kernel-yml
 
 test: $(LINUXKIT) test-images-patches | $(DIST)
 	@echo Running tests on $(GOMODULE)
@@ -365,11 +387,13 @@ clean:
 
 yetus:
 	@echo Running yetus
-	docker run -it --rm -v $(CURDIR):/src:delegated -v /tmp:/tmp ghcr.io/apache/yetus:0.14.1 \
+	mkdir -p yetus-output
+	docker run -it --rm -v $(CURDIR):/src:delegated,z ghcr.io/apache/yetus:0.14.1 \
 		--basedir=/src \
 		--dirty-workspace \
 		--empty-patch \
-		--plugins=all
+		--plugins=all \
+		--patch-dir=/src/yetus-output
 
 build-tools: $(LINUXKIT)
 	@echo Done building $<
@@ -403,12 +427,13 @@ $(EFI_PART): PKG=grub
 $(BOOT_PART): PKG=u-boot
 $(INITRD_IMG): PKG=mkimage-raw-efi
 $(INSTALLER_IMG): PKG=mkimage-raw-efi
+$(VERIFICATION_IMG): PKG=mkverification-raw-efi
 $(KERNEL_IMG): PKG=kernel
 $(IPXE_IMG): PKG=ipxe
 $(BIOS_IMG): PKG=uefi
 $(UBOOT_IMG): PKG=u-boot
 $(BSP_IMX_PART): PKG=bsp-imx
-$(EFI_PART) $(BOOT_PART) $(INITRD_IMG) $(INSTALLER_IMG) $(KERNEL_IMG) $(IPXE_IMG) $(BIOS_IMG) $(UBOOT_IMG) $(BSP_IMX_PART): $(LINUXKIT) | $(INSTALLER)
+$(EFI_PART) $(BOOT_PART) $(INITRD_IMG) $(INSTALLER_IMG) $(VERIFICATION_IMG) $(KERNEL_IMG) $(IPXE_IMG) $(BIOS_IMG) $(UBOOT_IMG) $(BSP_IMX_PART): $(LINUXKIT) | $(INSTALLER)
 	mkdir -p $(dir $@)
 	$(LINUXKIT) pkg build --pull --platforms linux/$(ZARCH) pkg/$(PKG) # running linuxkit pkg build _without_ force ensures that we either pull it down or build it.
 	cd $(dir $@) && $(LINUXKIT) cache export -arch $(DOCKER_ARCH_TAG) -format filesystem -outfile - $(shell $(LINUXKIT) pkg show-tag pkg/$(PKG)) | tar xvf - $(notdir $@)
@@ -441,6 +466,13 @@ run-installer-iso: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 run-installer-raw: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
 	qemu-img create -f ${IMG_FORMAT} $(TARGET_IMG) ${MEDIA_SIZE}M
 	$(QEMU_SYSTEM) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT) -drive file=$(INSTALLER).raw,format=raw $(QEMU_OPTS)
+
+run-verification-raw: $(BIOS_IMG) $(DEVICETREE_DTB) $(SWTPM)
+	qemu-img create -f ${IMG_FORMAT} $(TARGET_IMG) ${MEDIA_SIZE}M
+	@if [ "$(BUILD_DIR)" != "$(shell readlink -f $(CURRENT_DIR))" ]; then\
+		cp -r $(BUILD_DIR)/installer $(CURRENT_DIR);\
+	fi
+	$(QEMU_SYSTEM) -drive file=$(TARGET_IMG),format=$(IMG_FORMAT) -drive file=$(CURRENT_DIR)/verification.raw,format=raw $(QEMU_OPTS)
 
 run-installer-net: QEMU_TFTP_OPTS=,tftp=$(dir $(IPXE_IMG)),bootfile=$(notdir $(IPXE_IMG))
 run-installer-net: $(BIOS_IMG) $(IPXE_IMG) $(DEVICETREE_DTB) $(SWTPM) GETTY
@@ -535,6 +567,11 @@ $(INSTALLER):
 	# sample output 0.0.0-HEAD-a437e8e4-xen-amd64
 	@echo $(FULL_VERSION) > $(INSTALLER)/eve_version
 
+$(VERIFICATION):
+	@mkdir -p $@
+	@cp -r $(INSTALLER)/* $@
+	@cp -r pkg/eve-verification/verification/* $@
+	@echo $(FULL_VERSION) > $(VERIFICATION)/eve_version
 
 # convenience targets - so you can do `make config` instead of `make dist/config.img`, and `make installer` instead of `make dist/amd64/installer.img
 linuxkit: $(LINUXKIT)
@@ -552,6 +589,10 @@ live: $(LIVE_IMG) $(BIOS_IMG) current	; $(QUIET): "$@: Succeeded, LIVE_IMG=$(LIV
 live-%: $(LIVE).%		; $(QUIET): "$@: Succeeded, LIVE=$(LIVE)"
 installer: $(INSTALLER_IMG)
 installer-%: $(INSTALLER).% current ; @echo "$@: Succeeded, INSTALLER_IMG=$<"
+collected_sources: $(COLLECTED_SOURCES)
+gosources: $(GOSOURCES)
+verification: $(VERIFICATION_IMG)
+verification-%: $(VERIFICATION).% current ; @echo "$@: Succeeded, VERIFICATION_IMG=$<"
 
 $(SSH_KEY):
 	rm -f $@*
@@ -584,7 +625,13 @@ $(ROOTFS_IMG): $(ROOTFS_TAR) | $(INSTALLER)
 	        echo "ERROR: size of $@ is greater than 250MB (bigger than allocated partition)" && exit 1 || :
 	$(QUIET): $@: Succeeded
 
-$(SBOM): $(ROOTFS_TAR) | $(INSTALLER)
+sbom_info:
+	@echo "$(SBOM)"
+
+collected_sources_info:
+	@echo "$(COLLECTED_SOURCES)"
+
+$(SBOM): $(ROOTFS_TAR)| $(INSTALLER)
 	$(QUIET): $@: Begin
 	$(eval TMP_ROOTDIR := $(shell mktemp -d))
 	# this is a bit of a hack, but we need to extract the rootfs tar to a directory, and it fails if
@@ -593,8 +640,19 @@ $(SBOM): $(ROOTFS_TAR) | $(INSTALLER)
 	# this all can go away, and we can read the rootfs.tar
 	# see https://github.com/anchore/syft/issues/1400
 	tar xf $< -C $(TMP_ROOTDIR) --exclude "dev/*"
-	docker run -v $(TMP_ROOTDIR):/rootdir:ro $(SYFT_IMAGE) -o spdx-json /rootdir > $@
+	docker run -v $(TMP_ROOTDIR):/rootdir:ro -v $(CURDIR)/.syft.yaml:/syft.yaml:ro $(SYFT_IMAGE) -c /syft.yaml /rootdir > $@
 	rm -rf $(TMP_ROOTDIR)
+	$(QUIET): $@: Succeeded
+
+$(GOSOURCES):
+	$(QUIET): $@: Begin
+	$(shell GOBIN=$(BUILDTOOLS_BIN) GO111MODULE=on CGO_ENABLED=0 go install $(GOSOURCES_SOURCE)@$(GOSOURCES_VERSION))
+	@echo Done building packages
+	$(QUIET): $@: Succeeded
+
+$(COLLECTED_SOURCES): $(ROOTFS_TAR) $(GOSOURCES)| $(INSTALLER)
+	$(QUIET): $@: Begin
+	bash tools/collect-sources.sh $< $(CURDIR) $@
 	$(QUIET): $@: Succeeded
 
 $(LIVE).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMG) $(CONFIG_IMG) $(PERSIST_IMG) $(BSP_IMX_PART) | $(INSTALLER)
@@ -629,12 +687,22 @@ $(LIVE).parallels: $(LIVE).raw
 	qemu-img convert -O parallels $< $@/live.0.$(PARALLELS_UUID).hds
 	qemu-img info -f parallels --output json $(LIVE).parallels/live.0.$(PARALLELS_UUID).hds | jq --raw-output '.["virtual-size"]' | xargs ./tools/parallels_disk.sh $(LIVE) $(PARALLELS_UUID)
 
+$(VERIFICATION).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(VERIFICATION_IMG) $(CONFIG_IMG) $(PERSIST_IMG) $(BSP_IMX_PART) | $(VERIFICATION)
+	@[ "$(PLATFORM)" != "${PLATFORM/imx/}" ] && \
+		cp $(VERIFICATION)/bsp-imx/NXP-EULA-LICENSE.txt $(VERIFICATION)/NXP-EULA-LICENSE.txt && \
+		cp $(VERIFICATION)/bsp-imx/NXP-EULA-LICENSE.txt $(BUILD_DIR)/NXP-EULA-LICENSE.txt && \
+		cp $(VERIFICATION)/bsp-imx/"$(PLATFORM)"-flash.bin $(VERIFICATION)/imx8-flash.bin && \
+		cp $(VERIFICATION)/bsp-imx/"$(PLATFORM)"-flash.conf $(VERIFICATION)/imx8-flash.conf && \
+		cp $(VERIFICATION)/bsp-imx/*.dtb $(VERIFICATION)/boot  || :
+	./tools/makeverification.sh -C 650 $| $@ "conf_win verification inventory_win"
+	$(QUIET): $@: Succeeded
+
 # top-level linuxkit packages targets, note the one enforcing ordering between packages
 pkgs: RESCAN_DEPS=
 pkgs: build-tools $(PKGS)
 	@echo Done building packages
 
-pkg/pillar: pkg/dnsmasq pkg/strongswan pkg/gpt-tools pkg/dom0-ztools eve-pillar
+pkg/pillar: pkg/dnsmasq pkg/gpt-tools pkg/dom0-ztools eve-pillar
 	$(QUIET): $@: Succeeded
 pkg/xen-tools: pkg/uefi eve-xen-tools
 	$(QUIET): $@: Succeeded
@@ -645,7 +713,7 @@ $(RUNME) $(BUILD_YML):
 	cp pkg/eve/$(@F) $@
 
 EVE_ARTIFACTS=$(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(PERSIST_IMG) $(INITRD_IMG) $(INSTALLER_IMG) $(ROOTFS_IMG) $(SBOM) $(BSP_IMX_PART) fullname-rootfs $(BOOT_PART)
-eve: $(INSTALLER) $(EVE_ARTIFACTS) current $(RUNME) $(BUILD_YML) | $(BUILD_DIR)
+eve: kernel-yml $(INSTALLER) $(EVE_ARTIFACTS) current $(RUNME) $(BUILD_YML) | $(BUILD_DIR)
 	$(QUIET): "$@: Begin: EVE_REL=$(EVE_REL), HV=$(HV), LINUXKIT_PKG_TARGET=$(LINUXKIT_PKG_TARGET)"
 	cp images/*.yml $|
 	$(PARSE_PKGS) pkg/eve/Dockerfile.in > $|/Dockerfile
@@ -772,6 +840,7 @@ $(LINUXKIT): | $(GOBUILDER)
 	$(GOTREE) $(GOMODULE) $(BUILDTOOLS_BIN)
 	$(QUIET): $@: Succeeded
 
+
 $(GOBUILDER):
 	$(QUIET): "$@: Begin: GOBUILDER=$(GOBUILDER)"
 ifneq ($(BUILD),local)
@@ -818,6 +887,7 @@ get_pkg_build_dev_yml = $(if $(wildcard pkg/$1/build-dev.yml),build-dev.yml,buil
 get_pkg_build_rstats_yml = $(if $(wildcard pkg/$1/build-rstats.yml),build-rstats.yml,build.yml)
 
 eve-%: pkg/%/Dockerfile build-tools $(RESCAN_DEPS)
+	$(QUIET)if [ "$@" = "eve-kernel" ] || [ "$@" = "eve-new-kernel" ]; then tools/kernel-build-yml.sh; fi
 	$(QUIET): "$@: Begin: LINUXKIT_PKG_TARGET=$(LINUXKIT_PKG_TARGET)"
 	$(eval LINUXKIT_DOCKER_LOAD := $(if $(filter $(PKGS_DOCKER_LOAD),$*),--docker,))
 	$(eval LINUXKIT_BUILD_PLATFORMS_LIST := $(call uniq,linux/$(ZARCH) $(if $(filter $(PKGS_HOSTARCH),$*),linux/$(HOSTARCH),)))
@@ -885,29 +955,31 @@ help:
 	@echo "   yetus          run Apache Yetus to check the quality of the source tree"
 	@echo
 	@echo "Commonly used build targets:"
-	@echo "   build-tools    builds linuxkit utilities and installs under build-tools/bin"
-	@echo "   config         builds a bundle with initial EVE configs"
-	@echo "   pkgs           builds all EVE packages"
-	@echo "   pkg/XXX        builds XXX EVE package"
-	@echo "   rootfs         builds default EVE rootfs image (upload it to the cloud as BaseImage)"
-	@echo "   live           builds a full disk image of EVE which can be function as a virtual device"
-	@echo "   live-XXX       builds a particular kind of EVE live image (raw, qcow2, gcp, vdi, parallels)"
-	@echo "   installer-raw  builds raw disk installer image (to be installed on bootable media)"
-	@echo "   installer-iso  builds an ISO installers image (to be installed on bootable media)"
-	@echo "   installer-net  builds a tarball of artifacts to be used for PXE booting"
+	@echo "   build-tools      builds linuxkit utilities and installs under build-tools/bin"
+	@echo "   config           builds a bundle with initial EVE configs"
+	@echo "   pkgs             builds all EVE packages"
+	@echo "   pkg/XXX          builds XXX EVE package"
+	@echo "   rootfs           builds default EVE rootfs image (upload it to the cloud as BaseImage)"
+	@echo "   live             builds a full disk image of EVE which can be function as a virtual device"
+	@echo "   live-XXX         builds a particular kind of EVE live image (raw, qcow2, gcp, vdi, parallels)"
+	@echo "   installer-raw    builds raw disk installer image (to be installed on bootable media)"
+	@echo "   verification-raw builds raw disk verification image (to be installed on bootable media)"
+	@echo "   installer-iso    builds an ISO installers image (to be installed on bootable media)"
+	@echo "   installer-net    builds a tarball of artifacts to be used for PXE booting"
 	@echo
 	@echo "Commonly used run targets (note they don't automatically rebuild images they run):"
-	@echo "   run-compose        runs all EVE microservices via docker-compose deployment"
-	@echo "   run-build-vm       runs a build VM image"
-	@echo "   run-live           runs a full fledged virtual device on qemu (as close as it gets to actual h/w)"
-	@echo "   run-live-parallels runs a full fledged virtual device on Parallels Desktop"
-	@echo "   run-live-vb        runs a full fledged virtual device on VirtualBox"
-	@echo "   run-rootfs         runs a rootfs.img (limited usefulness e.g. quick test before cloud upload)"
-	@echo "   run-grub           runs our copy of GRUB bootloader and nothing else (very limited usefulness)"
-	@echo "   run-installer-iso  runs installer.iso (via qemu) and 'installs' EVE into (initially blank) target.img"
-	@echo "   run-installer-raw  runs installer.raw (via qemu) and 'installs' EVE into (initially blank) target.img"
-	@echo "   run-installer-net  runs installer.net (via qemu/iPXE) and 'installs' EVE into (initially blank) target.img"
-	@echo "   run-target         runs a full fledged virtual device on qemu from target.img (similar to run-live)"
+	@echo "   run-compose          runs all EVE microservices via docker-compose deployment"
+	@echo "   run-build-vm         runs a build VM image"
+	@echo "   run-live             runs a full fledged virtual device on qemu (as close as it gets to actual h/w)"
+	@echo "   run-live-parallels   runs a full fledged virtual device on Parallels Desktop"
+	@echo "   run-live-vb          runs a full fledged virtual device on VirtualBox"
+	@echo "   run-rootfs           runs a rootfs.img (limited usefulness e.g. quick test before cloud upload)"
+	@echo "   run-grub             runs our copy of GRUB bootloader and nothing else (very limited usefulness)"
+	@echo "   run-installer-iso    runs installer.iso (via qemu) and 'installs' EVE into (initially blank) target.img"
+	@echo "   run-installer-raw    runs installer.raw (via qemu) and 'installs' EVE into (initially blank) target.img"
+	@echo "   run-verification-raw runs verification.raw (via qemu), installs EVE into (initially blank) target.img, and verifies it"
+	@echo "   run-installer-net    runs installer.net (via qemu/iPXE) and 'installs' EVE into (initially blank) target.img"
+	@echo "   run-target           runs a full fledged virtual device on qemu from target.img (similar to run-live)"
 	@echo
 	@echo "make run is currently an alias for make run-live"
 	@echo

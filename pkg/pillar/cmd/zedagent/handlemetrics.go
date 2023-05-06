@@ -102,7 +102,8 @@ func handleAppDiskMetricCreate(ctxArg interface{}, key string, _ interface{}) {
 			continue
 		}
 		uuidStr := volumeStatus.VolumeID.String()
-		PublishVolumeToZedCloud(ctx, uuidStr, &volumeStatus, ctx.iteration)
+		PublishVolumeToZedCloud(ctx, uuidStr, &volumeStatus,
+			ctx.iteration, AllDest)
 	}
 	log.Functionf("handleAppDiskMetricCreate: %s", key)
 }
@@ -164,10 +165,10 @@ func encodeTestResults(tr types.TestResults) *info.ErrorInfo {
 	return errInfo
 }
 
-// Run a periodic post of the metrics
-func metricsTimerTask(ctx *zedagentContext, handleChannel chan interface{}) {
+// Run a periodic post of the metrics and info to an LOC if we have one
+func metricsAndInfoTimerTask(ctx *zedagentContext, handleChannel chan interface{}) {
 	iteration := 0
-	log.Functionln("starting report metrics timer task")
+	log.Functionln("starting report metrics/info timer task")
 	publishMetrics(ctx, iteration)
 
 	interval := time.Duration(ctx.globalConfig.GlobalValueInt(types.MetricInterval)) * time.Second
@@ -192,6 +193,12 @@ func metricsTimerTask(ctx *zedagentContext, handleChannel chan interface{}) {
 			publishMetrics(ctx, iteration)
 			ctx.ps.CheckMaxTimeTopic(wdName, "publishMetrics", start,
 				warningTime, errorTime)
+
+			locConfig := ctx.getconfigCtx.locConfig
+			if locConfig != nil {
+				// Publish all info by timer only for LOC
+				triggerPublishAllInfo(ctx, LOCDest)
+			}
 
 		case <-stillRunning.C:
 		}
@@ -341,10 +348,11 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	labelList := types.ReportLogicallabels(*deviceNetworkStatus)
 	for _, label := range labelList {
 		var metric *types.NetworkMetric
-		p := deviceNetworkStatus.GetPortByLogicallabel(label)
-		if p == nil {
+		ports := deviceNetworkStatus.GetPortsByLogicallabel(label)
+		if len(ports) == 0 {
 			continue
 		}
+		p := ports[0]
 		if !p.IsL3Port {
 			// metrics for ports from lower layers are not reported
 			continue
@@ -859,7 +867,7 @@ func publishMetrics(ctx *zedagentContext, iteration int) {
 	createProcessMetrics(ctx, ReportMetrics)
 
 	log.Tracef("PublishMetricsToZedCloud sending %s", ReportMetrics)
-	SendMetricsProtobuf(ctx.getconfigCtx, ReportMetrics, iteration)
+	sendMetricsProtobuf(ctx.getconfigCtx, ReportMetrics, iteration)
 	log.Tracef("publishMetrics: after send, total elapse sec %v", time.Since(startPubTime).Seconds())
 
 	// publish the cloud MetricsMap for zedagent for device debugging purpose
@@ -1081,7 +1089,7 @@ func encodeNetworkPortConfig(ctx *zedagentContext,
 // containing only the UUID to inform zedcloud about the delete.
 func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 	aiStatus *types.AppInstanceStatus,
-	aa *types.AssignableAdapters, iteration int) {
+	aa *types.AssignableAdapters, iteration int, dest destinationBitset) {
 	log.Functionf("PublishAppInfoToZedCloud uuid %s", uuid)
 	var ReportInfo = &info.ZInfoMsg{}
 
@@ -1166,7 +1174,7 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 					networkInfo.NtpServers = append(networkInfo.NtpServers, niStatus.NtpServer.String())
 				} else {
 					ntpServers := types.GetNTPServers(*deviceNetworkStatus,
-						niStatus.CurrentUplinkIntf)
+						niStatus.SelectedUplinkIntf)
 					for _, server := range ntpServers {
 						networkInfo.NtpServers = append(networkInfo.NtpServers, server.String())
 					}
@@ -1202,7 +1210,6 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 	if err != nil {
 		log.Fatal("PublishAppInfoToZedCloud proto marshaling error: ", err)
 	}
-	statusUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -1213,16 +1220,15 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, uuid, buf, size, statusUrl,
-		true, false, info.ZInfoTypes_ZiApp)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
+	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+		info.ZInfoTypes_ZiApp)
 }
 
 // PublishContentInfoToZedCloud is called per change, hence needs to try over all management ports
 // When content tree Status is nil it means a delete and we send a message
 // containing only the UUID to inform zedcloud about the delete.
 func PublishContentInfoToZedCloud(ctx *zedagentContext, uuid string,
-	ctStatus *types.ContentTreeStatus, iteration int) {
+	ctStatus *types.ContentTreeStatus, iteration int, dest destinationBitset) {
 
 	log.Functionf("PublishContentInfoToZedCloud uuid %s", uuid)
 	var ReportInfo = &info.ZInfoMsg{}
@@ -1272,7 +1278,6 @@ func PublishContentInfoToZedCloud(ctx *zedagentContext, uuid string,
 	if err != nil {
 		log.Fatal("PublishContentInfoToZedCloud proto marshaling error: ", err)
 	}
-	statusURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -1283,16 +1288,15 @@ func PublishContentInfoToZedCloud(ctx *zedagentContext, uuid string,
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, uuid, buf, size, statusURL,
-		true, false, info.ZInfoTypes_ZiContentTree)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
+	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+		info.ZInfoTypes_ZiContentTree)
 }
 
 // PublishVolumeToZedCloud is called per change, hence needs to try over all management ports
 // When volume status is nil it means a delete and we send a message
 // containing only the UUID to inform zedcloud about the delete.
 func PublishVolumeToZedCloud(ctx *zedagentContext, uuid string,
-	volStatus *types.VolumeStatus, iteration int) {
+	volStatus *types.VolumeStatus, iteration int, dest destinationBitset) {
 
 	log.Functionf("PublishVolumeToZedCloud uuid %s", uuid)
 	var ReportInfo = &info.ZInfoMsg{}
@@ -1351,7 +1355,6 @@ func PublishVolumeToZedCloud(ctx *zedagentContext, uuid string,
 	if err != nil {
 		log.Fatal("PublishVolumeToZedCloud proto marshaling error: ", err)
 	}
-	statusURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -1362,15 +1365,15 @@ func PublishVolumeToZedCloud(ctx *zedagentContext, uuid string,
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, uuid, buf, size, statusURL,
-		true, false, info.ZInfoTypes_ZiVolume)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
+	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+		info.ZInfoTypes_ZiVolume)
 }
 
 // PublishBlobInfoToZedCloud is called per change, hence needs to try over all management ports
 // When blob Status is nil it means a delete and we send a message
 // containing only the UUID to inform zedcloud about the delete.
-func PublishBlobInfoToZedCloud(ctx *zedagentContext, blobSha string, blobStatus *types.BlobStatus, iteration int) {
+func PublishBlobInfoToZedCloud(ctx *zedagentContext, blobSha string,
+	blobStatus *types.BlobStatus, iteration int, dest destinationBitset) {
 	log.Functionf("PublishBlobInfoToZedCloud blobSha %v", blobSha)
 	var ReportInfo = &info.ZInfoMsg{}
 
@@ -1410,7 +1413,6 @@ func PublishBlobInfoToZedCloud(ctx *zedagentContext, blobSha string, blobStatus 
 	if err != nil {
 		log.Fatal("PublishBlobInfoToZedCloud proto marshaling error: ", err)
 	}
-	statusURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -1421,16 +1423,18 @@ func PublishBlobInfoToZedCloud(ctx *zedagentContext, blobSha string, blobStatus 
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, blobSha, buf, size, statusURL,
-		true, false, info.ZInfoTypes_ZiBlobList)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
+	queueInfoToDest(ctx, dest, blobSha, buf, size, true, false, false,
+		info.ZInfoTypes_ZiBlobList)
 }
 
 // PublishEdgeviewToZedCloud - publish Edgeview info to controller
-func PublishEdgeviewToZedCloud(ctx *zedagentContext, evStatus *types.EdgeviewStatus) {
+func PublishEdgeviewToZedCloud(ctx *zedagentContext,
+	evStatus *types.EdgeviewStatus, dest destinationBitset) {
 
 	log.Functionf("PublishEdgeviewToZedCloud")
 	var ReportInfo = &info.ZInfoMsg{}
+	bailOnHTTPErr := true
+	forcePeriodic := false
 
 	evType := new(info.ZInfoTypes)
 	*evType = info.ZInfoTypes_ZiEdgeview
@@ -1447,6 +1451,15 @@ func PublishEdgeviewToZedCloud(ctx *zedagentContext, evStatus *types.EdgeviewSta
 		ReportEvInfo.CountDev = evStatus.CmdCountDev
 		ReportEvInfo.CountApp = evStatus.CmdCountApp
 		ReportEvInfo.CountExt = evStatus.CmdCountExt
+
+		// The first update is important, and that informs zedcloud the edgeivew is 'Active'.
+		// Edgeview publish the status when it first connects to dispatcher, which the counters
+		// are zeros. Notice that the edgeview container can start/stop at any time, and the
+		// counters will be cleared after every start.
+		if evStatus.CmdCountDev == 0 && evStatus.CmdCountApp == 0 && evStatus.CmdCountExt == 0 {
+			bailOnHTTPErr = false
+			forcePeriodic = true
+		}
 	}
 
 	ReportInfo.InfoContent = new(info.ZInfoMsg_Evinfo)
@@ -1460,7 +1473,6 @@ func PublishEdgeviewToZedCloud(ctx *zedagentContext, evStatus *types.EdgeviewSta
 	if err != nil {
 		log.Fatal("PublishEdgeviewToZedCloud proto marshaling error: ", err)
 	}
-	statusURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -1471,9 +1483,8 @@ func PublishEdgeviewToZedCloud(ctx *zedagentContext, evStatus *types.EdgeviewSta
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, "global", buf, size, statusURL,
-		true, false, info.ZInfoTypes_ZiEdgeview)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
+	queueInfoToDest(ctx, dest, "global", buf, size, bailOnHTTPErr, false, forcePeriodic,
+		info.ZInfoTypes_ZiEdgeview)
 	ctx.iteration++
 }
 
@@ -1536,29 +1547,49 @@ func SendProtobuf(url string, buf *bytes.Buffer, size int64,
 // Try all (first free, then rest) until it gets through.
 // Each iteration we try a different port for load spreading.
 // For each port we try all its local IP addresses until we get a success.
-func SendMetricsProtobuf(ctx *getconfigContext, ReportMetrics *metrics.ZMetricMsg,
-	iteration int) {
+func sendMetricsProtobufByURL(ctx *getconfigContext, metricsURL string,
+	ReportMetrics *metrics.ZMetricMsg, iteration int) {
+
 	data, err := proto.Marshal(ReportMetrics)
 	if err != nil {
-		log.Fatal("SendInfoProtobufStr proto marshaling error: ", err)
+		log.Fatal("sendMetricsProtobufByURL proto marshaling error: ", err)
 	}
 
 	buf := bytes.NewBuffer(data)
 	size := int64(proto.Size(ReportMetrics))
-	metricsUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "metrics")
 	const bailOnHTTPErr = false
 	const withNetTrace = false
 	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
 	defer cancel()
-	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, metricsUrl,
+	rv, err := zedcloud.SendOnAllIntf(ctxWork, zedcloudCtx, metricsURL,
 		size, buf, iteration, bailOnHTTPErr, withNetTrace)
 	if err != nil {
 		// Hopefully next timeout will be more successful
-		log.Errorf("SendMetricsProtobuf status %d failed: %s", rv.Status, err)
+		log.Errorf("sendMetricsProtobufByURL status %d failed: %s", rv.Status, err)
 		return
 	} else {
 		maybeUpdateMetricsTimer(ctx, true)
 		saveSentMetricsProtoMessage(data)
+	}
+}
+
+func sendMetricsProtobuf(ctx *getconfigContext,
+	ReportMetrics *metrics.ZMetricMsg, iteration int) {
+
+	url := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+		devUUID, "metrics")
+	sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration)
+
+	locConfig := ctx.locConfig
+
+	// Repeat metrics for LOC as well
+	if locConfig != nil {
+		// Don't block current execution context
+		go func() {
+			url := zedcloud.URLPathString(locConfig.LocURL, zedcloudCtx.V2API,
+				devUUID, "metrics")
+			sendMetricsProtobufByURL(ctx, url, ReportMetrics, iteration)
+		}()
 	}
 }
 
@@ -1670,15 +1701,38 @@ func protoEncodeNetworkInstanceMetricProto(status types.NetworkInstanceMetrics) 
 	vlanInfo := new(zmet.VlanInfo)
 	vlanInfo.NumTrunkPorts = status.VlanMetrics.NumTrunkPorts
 	vlanInfo.VlanCounts = status.VlanMetrics.VlanCounts
-	switch status.Type {
-	case types.NetworkInstanceTypeCloud:
-		protoEncodeVpnInstanceMetric(status, metric)
-
-	default:
-		protoEncodeGenericInstanceMetric(status, metric)
-	}
-
+	protoEncodeGenericInstanceMetric(status, metric)
+	metric.ProbeMetric = protoEncodeProbeMetrics(status.ProbeMetrics)
 	return metric
+}
+
+func protoEncodeProbeMetrics(probeMetrics types.ProbeMetrics) *metrics.ZProbeNIMetrics {
+	protoMetrics := &metrics.ZProbeNIMetrics{
+		CurrentIntf:    probeMetrics.SelectedUplinkIntf,
+		RemoteEndpoint: strings.Join(probeMetrics.RemoteEndpoints, ", "),
+		PingIntv:       probeMetrics.LocalPingIntvl,
+		RemotePingIntv: probeMetrics.RemotePingIntvl,
+		UplinkCnt:      probeMetrics.UplinkCount,
+	}
+	for _, intfStats := range probeMetrics.IntfProbeStats {
+		var nextHops []string
+		for _, nh := range intfStats.NexthopIPs {
+			nextHops = append(nextHops, nh.String())
+		}
+		protoMetrics.IntfMetric = append(protoMetrics.IntfMetric,
+			&metrics.ZProbeNIMetrics_ZProbeIntfMetric{
+				IntfName:           intfStats.IntfName,
+				GatewayNexhtop:     strings.Join(nextHops, ", "),
+				GatewayUP:          intfStats.NexthopUP,
+				RemoteHostUP:       intfStats.RemoteUP,
+				NexthopUpCount:     intfStats.NexthopUPCnt,
+				NexthopDownCount:   intfStats.NexthopDownCnt,
+				RemoteUpCount:      intfStats.RemoteUPCnt,
+				RemoteDownCount:    intfStats.RemoteDownCnt,
+				RemoteProbeLatency: intfStats.LatencyToRemote,
+			})
+	}
+	return protoMetrics
 }
 
 func protoEncodeFlowlogCounters(counters types.FlowlogCounters) *metrics.FlowlogCounters {

@@ -1,6 +1,6 @@
 # Build watchdogd for alpine
 
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 AS watchdog-build
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb AS watchdog-build
 ENV BUILD_PKGS build-base file libtirpc-dev linux-headers tar util-linux
 ENV PKGS alpine-baselayout musl-utils libsmartcols
 RUN eve-alpine-deploy.sh
@@ -33,7 +33,7 @@ RUN \
 ENV CONFIGURE_OPTS "--disable-nfs"
 
 RUN \
-    CPPFLAGS=-I/usr/include/tirpc ./configure ${CONFIGURE_OPTS} && make && make install DESTDIR=/out
+    CPPFLAGS=-I/usr/include/tirpc ./configure ${CONFIGURE_OPTS} && make -j "$(getconf _NPROCESSORS_ONLN)" && make install DESTDIR=/out
 
 FROM scratch
 WORKDIR /

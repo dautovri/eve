@@ -6,7 +6,7 @@
 package zedrouter
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/sirupsen/logrus"
@@ -43,41 +43,15 @@ neg-ttl=10
 dhcp-ttl=600
 `
 
-// dnsmasqLeaseDir is used to for the leases
-// of bridgeNames
-var dnsmasqLeaseDir = runDirname + "/dnsmasq.leases/"
-
-// dnsmasqLeasePath provides a unique file
-// We traverse the dnsmasqLeaseDir directory to get the list of bridgeNames
-func dnsmasqLeasePath(bridgeName string) string {
-	leasePathname := dnsmasqLeaseDir + "/" + bridgeName
-	return leasePathname
-}
-
-func dnsmasqBridgeNames() []string {
-	var bridgeNames []string
-
-	locations, err := os.ReadDir(dnsmasqLeaseDir)
-	if err != nil {
-		log.Error(err)
-		return bridgeNames
-	}
-
-	for _, location := range locations {
-		bridgeNames = append(bridgeNames, location.Name())
-	}
-	return bridgeNames
-}
-
 func dnsmasqInitDirs() {
-	if _, err := os.Stat(dnsmasqLeaseDir); err != nil {
-		log.Functionf("Create %s\n", dnsmasqLeaseDir)
-		if err := os.Mkdir(dnsmasqLeaseDir, 0755); err != nil {
+	if _, err := os.Stat(devicenetwork.DnsmasqLeaseDir); err != nil {
+		log.Functionf("Create %s\n", devicenetwork.DnsmasqLeaseDir)
+		if err := os.Mkdir(devicenetwork.DnsmasqLeaseDir, 0755); err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		// dnsmasq needs to read as nobody
-		if err := os.Chmod(dnsmasqLeaseDir, 0755); err != nil {
+		if err := os.Chmod(devicenetwork.DnsmasqLeaseDir, 0755); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -113,7 +87,7 @@ func dnsmasqDhcpHostDir(bridgeName string) string {
 // Also called when we need to update the ipsets
 func createDnsmasqConfiglet(
 	ctx *zedrouterContext,
-	bridgeName string, bridgeIPAddr string,
+	bridgeName string, bridgeIPAddr net.IP,
 	netstatus *types.NetworkInstanceStatus, hostsDir string,
 	ipsetHosts []string, uplink string,
 	dnsServers []net.IP, ntpServers []net.IP) {
@@ -140,61 +114,88 @@ func createDnsmasqConfiglet(
 	dhcphostsDir := dnsmasqDhcpHostDir(bridgeName)
 	ensureDir(dhcphostsDir)
 
-	file.WriteString(dnsmasqStatic)
+	createDnsmasqConfigletToWriter(file, ctx, bridgeName, bridgeIPAddr, netstatus, hostsDir, ipsetHosts, uplink, dnsServers, ntpServers)
+}
+
+func dhcpv4RangeConfig(start, end net.IP) (string, error) {
+	var dhcpRange string
+
+	if start != nil {
+		if end == nil {
+			dhcpRange = fmt.Sprintf("%s,static", start.String())
+		} else {
+			if bytes.Compare(start, end) > 0 {
+				return dhcpRange, fmt.Errorf("createDnsmasqConfigletToWriter: invalid dhcp-range %s-%s",
+					start.String(), end.String())
+			}
+			// full dhcp-range is not possible with static, see https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html
+			// "dhcp-range=[tag:<tag>[,tag:<tag>],][set:<tag>,]<start-addr>[,<end-addr>|<mode>[,<netmask>[,<broadcast>]]][,<lease time>]"
+			dhcpRange = fmt.Sprintf("%s,%s", start.String(), end.String())
+		}
+	}
+
+	return dhcpRange, nil
+}
+
+func createDnsmasqConfigletToWriter(
+	buffer io.Writer,
+	ctx *zedrouterContext,
+	bridgeName string, bridgeIPAddr net.IP,
+	netstatus *types.NetworkInstanceStatus, hostsDir string,
+	ipsetHosts []string, uplink string,
+	dnsServers []net.IP, ntpServers []net.IP) {
+
+	io.WriteString(buffer, dnsmasqStatic)
+
+	dhcphostsDir := dnsmasqDhcpHostDir(bridgeName)
 
 	// XXX look at zedrouter loglevel; perhaps we should introduce a
 	// separate logger for dnsmasq or per bridge to have more fine-grained
 	// control
 	switch logger.GetLevel() {
 	case logrus.TraceLevel:
-		file.WriteString("log-queries\n")
-		file.WriteString("log-dhcp\n")
+		io.WriteString(buffer, "log-queries\n")
+		io.WriteString(buffer, "log-dhcp\n")
 	case logrus.DebugLevel:
-		file.WriteString("log-dhcp\n")
+		io.WriteString(buffer, "log-dhcp\n")
 	}
 
-	file.WriteString(fmt.Sprintf("dhcp-leasefile=%s\n",
-		dnsmasqLeasePath(bridgeName)))
+	io.WriteString(buffer, fmt.Sprintf("dhcp-leasefile=%s\n",
+		devicenetwork.DnsmasqLeaseFilePath(bridgeName)))
 
 	// Pick file where dnsmasq should send DNS read upstream
 	// If we have no uplink for this network instance that is nowhere
 	// If we have an uplink but no dnsServers for it, then we let
 	// dnsmasq use the host's /etc/resolv.conf
 	if uplink == "" {
-		file.WriteString("no-resolv\n")
+		io.WriteString(buffer, "no-resolv\n")
 	} else if len(dnsServers) != 0 {
 		for _, s := range dnsServers {
-			file.WriteString(fmt.Sprintf("server=%s@%s\n", s, uplink))
+			io.WriteString(buffer, fmt.Sprintf("server=%s@%s\n", s, uplink))
 		}
-		file.WriteString("no-resolv\n")
+		io.WriteString(buffer, "no-resolv\n")
 	}
 
 	for _, host := range ipsetHosts {
 		ipsetBasename := hostIpsetBasename(host)
-		file.WriteString(fmt.Sprintf("ipset=/%s/ipv4.%s,ipv6.%s\n",
+		io.WriteString(buffer, fmt.Sprintf("ipset=/%s/ipv4.%s,ipv6.%s\n",
 			host, ipsetBasename, ipsetBasename))
 	}
-	file.WriteString(fmt.Sprintf("pid-file=/run/dnsmasq.%s.pid\n",
+	io.WriteString(buffer, fmt.Sprintf("pid-file=/run/dnsmasq.%s.pid\n",
 		bridgeName))
-	file.WriteString(fmt.Sprintf("interface=%s\n", bridgeName))
+	io.WriteString(buffer, fmt.Sprintf("interface=%s\n", bridgeName))
 	isIPv6 := false
-	if bridgeIPAddr != "" {
-		ip := net.ParseIP(bridgeIPAddr)
-		if ip == nil {
-			log.Fatalf("createDnsmasqConfiglet failed to parse IP %s",
-				bridgeIPAddr)
-		}
-		isIPv6 = (ip.To4() == nil)
-		file.WriteString(fmt.Sprintf("listen-address=%s\n",
+	if !isEmptyIP(bridgeIPAddr) {
+		isIPv6 = bridgeIPAddr.To4() == nil
+		io.WriteString(buffer, fmt.Sprintf("listen-address=%s\n",
 			bridgeIPAddr))
 	} else {
 		// XXX error if there is no bridgeIPAddr?
 	}
-	file.WriteString(fmt.Sprintf("hostsdir=%s\n", hostsDir))
-	file.WriteString(fmt.Sprintf("dhcp-hostsdir=%s\n", dhcphostsDir))
+	io.WriteString(buffer, fmt.Sprintf("hostsdir=%s\n", hostsDir))
+	io.WriteString(buffer, fmt.Sprintf("dhcp-hostsdir=%s\n", dhcphostsDir))
 
 	ipv4Netmask := "255.255.255.0" // Default unless there is a Subnet
-	dhcpRange := bridgeIPAddr      // Default unless there is a DhcpRange
 
 	// By default dnsmasq advertises a router (and we can have a
 	// static router defined in the NetworkInstanceConfig).
@@ -214,17 +215,17 @@ func createDnsmasqConfiglet(
 		} else {
 			router = netstatus.Gateway.String()
 		}
-	} else if bridgeIPAddr != "" {
-		router = bridgeIPAddr
+	} else if !isEmptyIP(bridgeIPAddr) {
+		router = bridgeIPAddr.String()
 	} else {
 		advertizeRouter = false
 	}
 	if netstatus.DomainName != "" {
 		if isIPv6 {
-			file.WriteString(fmt.Sprintf("dhcp-option=option:domain-search,%s\n",
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:domain-search,%s\n",
 				netstatus.DomainName))
 		} else {
-			file.WriteString(fmt.Sprintf("dhcp-option=option:domain-name,%s\n",
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:domain-name,%s\n",
 				netstatus.DomainName))
 		}
 	}
@@ -235,11 +236,11 @@ func createDnsmasqConfiglet(
 		for _, srvIP := range netstatus.DnsServers {
 			addrList = append(addrList, srvIP.String())
 		}
-		file.WriteString(fmt.Sprintf("dhcp-option=option:dns-server,%s\n",
+		io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:dns-server,%s\n",
 			strings.Join(addrList, ",")))
 	}
 	if netstatus.NtpServer != nil {
-		file.WriteString(fmt.Sprintf("dhcp-option=option:ntp-server,%s\n",
+		io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:ntp-server,%s\n",
 			netstatus.NtpServer.String()))
 	} else {
 		ntpStr := ""
@@ -247,7 +248,7 @@ func createDnsmasqConfiglet(
 			ntpStr += "," + s.String()
 		}
 		if len(ntpStr) != 0 {
-			file.WriteString("dhcp-option=option:ntp-server" + ntpStr + "\n")
+			io.WriteString(buffer, "dhcp-option=option:ntp-server"+ntpStr+"\n")
 		}
 	}
 	if netstatus.Subnet.IP != nil {
@@ -257,45 +258,46 @@ func createDnsmasqConfiglet(
 		if advertizeRouter && !ctx.disableDHCPAllOnesNetMask {
 			// Network prefix "255.255.255.255" will force packets to go through
 			// dom0 virtual router that makes the packets pass through ACLs and flow log.
-			file.WriteString(fmt.Sprintf("dhcp-option=option:netmask,%s\n",
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:netmask,%s\n",
 				"255.255.255.255"))
 		} else {
-			file.WriteString(fmt.Sprintf("dhcp-option=option:netmask,%s\n",
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:netmask,%s\n",
 				ipv4Netmask))
 		}
 	}
 	if advertizeRouter {
 		// IPv6 XXX needs to be handled in radvd
 		if !isIPv6 {
-			file.WriteString(fmt.Sprintf("dhcp-option=option:router,%s\n",
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:router,%s\n",
 				router))
 			if !ctx.disableDHCPAllOnesNetMask {
-				file.WriteString(fmt.Sprintf("dhcp-option=option:classless-static-route,%s/32,%s,%s,%s,%s,%s\n",
+				io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:classless-static-route,%s/32,%s,%s,%s,%s,%s\n",
 					router, "0.0.0.0",
 					"0.0.0.0/0", router,
 					netstatus.Subnet.String(), router))
 			}
 		}
 	} else {
-		log.Functionf("createDnsmasqConfiglet: no router\n")
+		log.Functionf("createDnsmasqConfigletToWriter: no router\n")
 		if !isIPv6 {
-			file.WriteString(fmt.Sprintf("dhcp-option=option:router\n"))
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:router\n"))
 		}
 		if !advertizeDns {
 			// Handle isolated network by making sure
 			// we are not a DNS server. Can be overridden
 			// with the DnsServers above
-			log.Functionf("createDnsmasqConfiglet: no DNS server\n")
-			file.WriteString(fmt.Sprintf("dhcp-option=option:dns-server\n"))
+			log.Functionf("createDnsmasqConfigletToWriter: no DNS server\n")
+			io.WriteString(buffer, fmt.Sprintf("dhcp-option=option:dns-server\n"))
 		}
 	}
-	if netstatus.DhcpRange.Start != nil {
-		dhcpRange = netstatus.DhcpRange.Start.String()
-	}
 	if isIPv6 {
-		file.WriteString(fmt.Sprintf("dhcp-range=::,static,0,60m\n"))
+		io.WriteString(buffer, "dhcp-range=::static,0,60m\n")
 	} else {
-		file.WriteString(fmt.Sprintf("dhcp-range=%s,static,%s,60m\n",
+		dhcpRange, err := dhcpv4RangeConfig(netstatus.DhcpRange.Start, netstatus.DhcpRange.End)
+		if err != nil {
+			log.Fatalf("dhcpv4RangeConfigLine failed with %+v", err)
+		}
+		io.WriteString(buffer, fmt.Sprintf("dhcp-range=%s,%s,60m\n",
 			dhcpRange, ipv4Netmask))
 	}
 }
@@ -310,7 +312,8 @@ func addhostDnsmasq(bridgeName string, appMac string, appIPAddr string,
 	}
 	ip := net.ParseIP(appIPAddr)
 	if ip == nil {
-		log.Fatalf("addhostDnsmasq failed to parse IP %s", appIPAddr)
+		log.Warnf("addhostDnsmasq failed to parse IP %s", appIPAddr)
+		return
 	}
 	isIPv6 := (ip.To4() == nil)
 	suffix := ".inet"
@@ -483,305 +486,8 @@ func stopDnsmasq(bridgeName string, printOnError bool, delConfiglet bool) {
 	}
 }
 
-// checkAndPublishDhcpLeases needs to be called periodically since it
-// refreshes the LastSeen and does garbage collection based on that timestamp
-func checkAndPublishDhcpLeases(ctx *zedrouterContext) {
-	changed := updateAllLeases(ctx)
-	haveSwitch := haveSwitchNetworkInstances(ctx)
-	if !changed && !haveSwitch {
-		return
-	}
-	// Walk all and update all which gained or lost a lease
-	pub := ctx.pubAppNetworkStatus
-	items := pub.GetAll()
-	for _, st := range items {
-		changed := false
-		status := st.(types.AppNetworkStatus)
-		for i := range status.UnderlayNetworkList {
-			ulStatus := &status.UnderlayNetworkList[i]
-			var ipv4Assigned bool
-			var leasedIPv4 net.IP
-			var snoopedIPv6s []net.IP
-			netconfig := lookupNetworkInstanceConfig(ctx,
-				ulStatus.Network.String())
-			if netconfig != nil && netconfig.Type == types.NetworkInstanceTypeSwitch {
-				leasedIPv4, snoopedIPv6s, ipv4Assigned = lookupVifIPTrig(ctx, ulStatus.Mac)
-				log.Functionf("found %t IPv4 %s, IPv6 %s for %s",
-					ipv4Assigned, leasedIPv4.String(), snoopedIPv6s, ulStatus.Mac)
-				if !ipListEqual(snoopedIPv6s, ulStatus.AllocatedIPv6List) {
-					ipList := []string{}
-					for _, ip := range snoopedIPv6s {
-						ipList = append(ipList, ip.String())
-					}
-					ulStatus.AllocatedIPv6List = ipList
-					changed = true
-					continue
-				}
-			} else {
-				l := findLease(ctx, status.Key(), ulStatus.Mac, true)
-				ipv4Assigned = (l != nil)
-				if ipv4Assigned {
-					leasedIPv4 = net.ParseIP(l.IPAddr)
-				}
-				log.Functionf("found %t IP %s for %s",
-					ipv4Assigned, leasedIPv4.String(), ulStatus.Mac)
-			}
-			assignedIP := net.ParseIP(ulStatus.AllocatedIPv4Addr)
-			if ulStatus.IPv4Assigned != ipv4Assigned || assignedIP == nil || !assignedIP.Equal(leasedIPv4) {
-				log.Functionf("Changing(%s) %s mac %s to %t",
-					status.Key(), status.DisplayName,
-					ulStatus.Mac, ipv4Assigned)
-				ulStatus.IPv4Assigned = ipv4Assigned
-				if !ipv4Assigned {
-					ulStatus.IPAddrMisMatch = true
-					changed = true
-					continue
-				}
-				// Pick up from VIFIPTrig on change
-				if ulStatus.AllocatedIPv4Addr == "" || assignedIP == nil ||
-					(netconfig != nil && netconfig.Type == types.NetworkInstanceTypeSwitch && !assignedIP.Equal(leasedIPv4)) {
-					ulStatus.IPAddrMisMatch = false
-					if !isEmptyIP(leasedIPv4) {
-						ulStatus.AllocatedIPv4Addr = leasedIPv4.String()
-					}
-					changed = true
-					log.Noticef("Setting IP to %s",
-						leasedIPv4.String())
-					continue
-				}
-				if assignedIP != nil && !assignedIP.Equal(leasedIPv4) {
-					log.Errorf("IP address mismatch found - App: %s, Mac: %s, Allocated IP: %s, Leased IP: %s",
-						status.DisplayName, ulStatus.Mac, ulStatus.AllocatedIPv4Addr, leasedIPv4.String())
-					ulStatus.IPAddrMisMatch = true
-					// XXX Should we do the following at this point?
-					// 1) Stop dnsmasq corresponding to this network instance
-					// 2) Remove the leases file
-					// 3) Start dnsmasq again.
-					// App will get the correct IP address at least in the next DHCP cycle.
-					// XXX Should we send the leased IP also as part of app status to cloud?
-				} else {
-					ulStatus.IPAddrMisMatch = false
-				}
-				changed = true
-			}
-		}
-		if changed {
-			publishAppNetworkStatus(ctx, &status)
-		}
-	}
-}
-
 func isEmptyIP(ip net.IP) bool {
-	return ip.Equal(net.IP{})
-}
-
-func ipListEqual(one []net.IP, two []string) bool {
-	if len(one) != len(two) {
-		return false
-	}
-	for i := 0; i < len(one); i++ {
-		if one[i].String() != two[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// findLease returns a pointer so the caller can update the
-// lease information
-// Ignores a lease which has expired if ignoreExpired is set
-func findLease(ctx *zedrouterContext, hostname string, mac string, ignoreExpired bool) *dnsmasqLease {
-	for i := range ctx.dhcpLeases {
-		l := &ctx.dhcpLeases[i]
-		if l.Hostname != hostname {
-			continue
-		}
-		if l.MacAddr != mac {
-			continue
-		}
-		if ignoreExpired && l.LeaseTime.Before(time.Now()) {
-			log.Warnf("Ignoring expired lease: %v", *l)
-			return nil
-		}
-		log.Tracef("Found %v", *l)
-		return l
-	}
-	log.Tracef("Not found %s/%s", hostname, mac)
-	return nil
-}
-
-// addOrUpdateLease returns true if something changed
-// XXX Assumes MAC addresses unique. take bridgename as argument to
-// keep separate per bridge?
-func addOrUpdateLease(ctx *zedrouterContext, lease dnsmasqLease) bool {
-	l := findLease(ctx, lease.Hostname, lease.MacAddr, false)
-	if l == nil {
-		ctx.dhcpLeases = append(ctx.dhcpLeases, lease)
-		log.Functionf("Adding lease %v", lease)
-		return true
-	} else if !cmp.Equal(*l, lease) {
-		log.Functionf("Updating lease %v with %v", *l, lease)
-		*l = lease
-		return true
-	} else {
-		return false
-	}
-}
-
-// markRemoveLease will fatal if the lease does not exist
-// Merely marks for removal; see purgeRemovedLeases
-func markRemoveLease(ctx *zedrouterContext, hostname string, mac string) {
-	l := findLease(ctx, hostname, mac, false)
-	if l == nil {
-		log.Fatalf("Lease not found %s/%s", hostname, mac)
-	}
-	log.Functionf("Removing lease %v", l)
-	l.Remove = true
-}
-
-// purgeRemovedLeases does the actual removal of the marked entries
-func purgeRemovedLeases(ctx *zedrouterContext) {
-	var newLeases []dnsmasqLease
-	var removed = 0
-	for _, lease := range ctx.dhcpLeases {
-		if lease.Remove {
-			removed++
-			continue
-		}
-		newLeases = append(newLeases, lease)
-	}
-	ctx.dhcpLeases = newLeases
-	log.Functionf("purgeRemovedLeases removed %d", removed)
-	// XXX change to log.Tracef
-	log.Functionf("XXX after purgeRemovedLeases %v", ctx.dhcpLeases)
-}
-
-type dnsmasqLease struct {
-	BridgeName string
-	LastSeen   time.Time // For garbage collection
-	Remove     bool      // Marked for removal
-
-	// From leases file
-	LeaseTime time.Time
-	MacAddr   string
-	IPAddr    string
-	Hostname  string
-}
-
-const leaseGCTime = 5 * time.Minute
-
-// updateAllLeases maintains ctx.dhcpLeases. It reads all of the leases and
-// adds new ones immediately. It removes an old old if it haven't seen in
-// 30 seconds (this is to handle file truncation/rewrite by dnsmasq) This
-// timer assumes the function is called very 10 seconds.
-// Returns true if there was a change to at least one lease
-func updateAllLeases(ctx *zedrouterContext) bool {
-	changed := false
-	bridgeNames := dnsmasqBridgeNames()
-	log.Tracef("bridgeNames: %v", bridgeNames)
-	for _, bridgeName := range bridgeNames {
-		leases, err := readLeases(bridgeName)
-		if err != nil {
-			log.Warnf("readLeases(%s) failed: %s", bridgeName, err)
-			continue
-		}
-		log.Tracef("read leases(%s) %v", bridgeName, leases)
-		// Add any new ones
-		for _, l := range leases {
-			if addOrUpdateLease(ctx, l) {
-				changed = true
-			}
-		}
-	}
-	// Look for any old leases
-	// XXX time limit is 5 minutes and we are assuming we get called
-	// every 10 seconds or so.
-	removed := false
-	for _, l := range ctx.dhcpLeases {
-		if time.Since(l.LastSeen) <= leaseGCTime ||
-			time.Since(l.LeaseTime) <= leaseGCTime {
-			continue
-		}
-		log.Functionf("lease %v garbage collected: lastSeen %v ago, lease expiry %v ago",
-			l, time.Since(l.LastSeen), time.Since(l.LeaseTime))
-		markRemoveLease(ctx, l.Hostname, l.MacAddr)
-		changed = true
-		removed = true
-	}
-	if removed {
-		purgeRemovedLeases(ctx)
-	}
-	return changed
-}
-
-// readLeases returns a slice of structs with mac, IP, uuid
-// XXX Do we need to handle file which is deleted when bridge/networkinstance is deleted?
-//
-// Example content of leasesFile
-// 1560664900 00:16:3e:00:01:01 10.1.0.3 63120af3-42c4-4d84-9faf-de0582d496c2 *
-func readLeases(bridgeName string) ([]dnsmasqLease, error) {
-
-	var leases []dnsmasqLease
-	leasesFile := dnsmasqLeasePath(bridgeName)
-	info, err := os.Stat(leasesFile)
-	if err != nil {
-		return leases, err
-	}
-	fileDesc, err := os.Open(leasesFile)
-	if err != nil {
-		return leases, err
-	}
-	reader := bufio.NewReader(fileDesc)
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				log.Errorln("ReadString ", err)
-				return leases, err
-			}
-			break
-		}
-		// remove trailing "/n" from line
-		line = line[0 : len(line)-1]
-
-		// Should have 5 space-separated fields. We only use 4.
-		tokens := strings.Split(line, " ")
-		if len(tokens) < 4 {
-			log.Errorf("Less than 4 fields in leases file: %v",
-				tokens)
-			continue
-		}
-		i, err := strconv.ParseInt(tokens[0], 10, 64)
-		if err != nil {
-			log.Errorf("Bad unix time %s: %s", tokens[0], err)
-			i = 0
-		}
-		lease := dnsmasqLease{
-			BridgeName: bridgeName,
-			LastSeen:   info.ModTime(),
-			LeaseTime:  time.Unix(i, 0),
-			MacAddr:    tokens[1],
-			IPAddr:     tokens[2],
-			Hostname:   tokens[3],
-		}
-		leases = append(leases, lease)
-	}
-	return leases, nil
-}
-
-// lookupVifIPTrig returns the IP address for the MAC address
-// XXX Assumes MAC addresses unique. take bridgename as argument to
-// XXX No subscribers. Use local map from (bridgename, mac) to IP? Used by
-// flowstats goroutine hence  would need lock.
-func lookupVifIPTrig(ctx *zedrouterContext, mac string) (net.IP, []net.IP, bool) {
-	pub := ctx.pubAppVifIPTrig
-	st, _ := pub.Get(mac)
-	if st == nil {
-		return net.IP{}, []net.IP{}, false
-	}
-	vifTrig := st.(types.VifIPTrig)
-	ipv4Up := !isEmptyIP(vifTrig.IPv4Addr)
-	return vifTrig.IPv4Addr, vifTrig.IPv6Addrs, ipv4Up
+	return ip == nil || ip.Equal(net.IP{})
 }
 
 // When we restart dnsmasq with smaller changes like changing DNS server

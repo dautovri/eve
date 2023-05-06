@@ -10,6 +10,7 @@
 package zedrouter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -29,10 +30,12 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
+	"github.com/lf-edge/eve/pkg/pillar/nistate"
 	"github.com/lf-edge/eve/pkg/pillar/objtonum"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/uplinkprober"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	uuid "github.com/satori/go.uuid"
@@ -49,6 +52,8 @@ const (
 	// Publish 4X more often than zedagent publishes to controller
 	// to reduce effect of quantization errors
 	publishTickerDivider = 4
+	// After 30 min of a flow not being touched, the publication will be removed.
+	flowStaleSec int64 = 1800
 )
 
 // Set from Makefile
@@ -75,7 +80,6 @@ type zedrouterContext struct {
 	ready                  bool
 	subGlobalConfig        pubsub.Subscription
 	GCInitialized          bool
-	dhcpLeases             []dnsmasqLease
 	subLocationInfo        pubsub.Subscription
 	subWwanStatus          pubsub.Subscription
 	subWwanMetrics         pubsub.Subscription
@@ -92,14 +96,12 @@ type zedrouterContext struct {
 	pubNetworkInstanceStatus  pubsub.Publication
 	pubNetworkInstanceMetrics pubsub.Publication
 	pubAppFlowMonitor         pubsub.Publication
-	pubAppVifIPTrig           pubsub.Publication
 	pubAppContainerMetrics    pubsub.Publication
 	networkInstanceStatusMap  sync.Map
 	NLaclMap                  map[uuid.UUID]map[string]types.ULNetworkACLs // app uuid plus bridge ul name
 	dnsServers                map[string][]net.IP                          // Key is ifname
-	checkNIUplinks            chan bool
-	hostProbeTimer            *time.Timer
-	hostFastProbe             bool
+	uplinkProber              *uplinkprober.UplinkProber
+	niStateCollector          nistate.Collector
 	appNetCreateTimer         *time.Timer
 	appCollectStatsRunning    bool
 	appStatsMutex             sync.Mutex // to protect the changing appNetworkStatus & appCollectStatsRunning
@@ -296,15 +298,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	zedrouterCtx.pubAppFlowMonitor = pubAppFlowMonitor
 
-	pubAppVifIPTrig, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName: agentName,
-		TopicType: types.VifIPTrig{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	zedrouterCtx.pubAppVifIPTrig = pubAppVifIPTrig
-
 	pubAppContainerMetrics, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
 		TopicType: types.AppContainerMetrics{},
@@ -314,10 +307,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	zedrouterCtx.pubAppContainerMetrics = pubAppContainerMetrics
 
-	nms := getNetworkMetrics(&zedrouterCtx) // Need type of data
-	pub, err := ps.NewPublication(pubsub.PublicationOptions{
+	pubNetworkMetrics, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
-		TopicType: nms,
+		TopicType: types.NetworkMetrics{},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -577,14 +569,20 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		time.Duration(max))
 	zedrouterCtx.publishTicker = &publishTicker
 
-	flowStatIntv := time.Duration(120 * time.Second) // 120 sec, flow timeout if less than150 sec
-	fmax := float64(flowStatIntv)
-	fmin := fmax * 0.9
-	flowStatTimer := flextimer.NewRangeTicker(time.Duration(fmin),
-		time.Duration(fmax))
+	niStateCollector := nistate.NewLinuxCollector(log)
+	zedrouterCtx.niStateCollector = niStateCollector
+	flowUpdates := niStateCollector.WatchFlows()
+	ipAssignUpdates := niStateCollector.WatchIPAssignments()
 
-	setProbeTimer(&zedrouterCtx, nhProbeInterval)
-	zedrouterCtx.checkNIUplinks = make(chan bool, 1) // allow one signal without blocking
+	reachProber := uplinkprober.NewControllerReachProber(
+		log, agentName, zedrouterCtx.zedcloudMetrics)
+	uplinkProber := uplinkprober.NewUplinkProber(
+		log, uplinkprober.DefaultConfig(), reachProber)
+	zedrouterCtx.uplinkProber = uplinkProber
+	probeUpdates := uplinkProber.WatchProbeUpdates()
+	if zedrouterCtx.deviceNetworkStatus != nil {
+		uplinkProber.ApplyDNSUpdate(*zedrouterCtx.deviceNetworkStatus)
+	}
 
 	zedrouterCtx.appNetCreateTimer = time.NewTimer(1 * time.Second)
 	zedrouterCtx.appNetCreateTimer.Stop()
@@ -597,43 +595,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	zedrouterCtx.ready = true
 	log.Functionf("zedrouterCtx.ready\n")
-
-	// First wait for restarted from zedmanager to
-	// reduce the number of LISP-RESTARTs
-	for !subAppNetworkConfig.Restarted() {
-		log.Functionf("Waiting for zedrouter to report restarted")
-		select {
-		case change := <-subGlobalConfig.MsgChan():
-			subGlobalConfig.ProcessChange(change)
-
-		case change := <-subAssignableAdapters.MsgChan():
-			subAssignableAdapters.ProcessChange(change)
-
-		case change := <-subAppNetworkConfig.MsgChan():
-			// If we have NetworkInstanceConfig process it first
-			checkAndProcessNetworkInstanceConfig(&zedrouterCtx)
-			subAppNetworkConfig.ProcessChange(change)
-
-		case change := <-subDeviceNetworkStatus.MsgChan():
-			subDeviceNetworkStatus.ProcessChange(change)
-
-		case change := <-subNetworkInstanceConfig.MsgChan():
-			log.Functionf("AppNetworkConfig - waiting to Restart - "+
-				"InstanceConfig change at %+v", time.Now())
-			subNetworkInstanceConfig.ProcessChange(change)
-		}
-		// Are we likely to have seen all of the initial config?
-		if zedrouterCtx.triggerNumGC &&
-			time.Since(zedrouterCtx.receivedConfigTime) > 5*time.Minute {
-
-			start := time.Now()
-			gcNumAllocators(&zedrouterCtx)
-			zedrouterCtx.triggerNumGC = false
-			ps.CheckMaxTimeTopic(agentName, "allocatorGC", start,
-				warningTime, errorTime)
-		}
-	}
-	log.Functionf("Zedrouter has restarted. Entering main Select loop")
 
 	for {
 		select {
@@ -708,22 +669,16 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case <-zedrouterCtx.publishTicker.C:
 			start := time.Now()
 			log.Traceln("publishTicker at", time.Now())
-			nms := getNetworkMetrics(&zedrouterCtx)
-			err := pub.Publish("global", nms)
-			if err != nil {
-				log.Errorf("getNetworkMetrics failed %s\n", err)
+			nms, err := niStateCollector.GetNetworkMetrics()
+			if err == nil {
+				err = pubNetworkMetrics.Publish("global", nms)
+				if err != nil {
+					log.Errorf("Failed to publish network metrics: %v", err)
+				}
+				publishNetworkInstanceMetricsAll(&zedrouterCtx, &nms)
+			} else {
+				log.Error(err)
 			}
-			// nms is the unmodified output from getNetworkMetrics()
-			// we do not call getNetworkMetrics twice to not spend resources in calls to iptables
-			publishNetworkInstanceMetricsAll(&zedrouterCtx, &nms)
-			ps.CheckMaxTimeTopic(agentName, "publishNetworkInstanceMetrics", start,
-				warningTime, errorTime)
-
-			start = time.Now()
-			// Check for changes to DHCP leases
-			// XXX can we trigger it as part of boot? Or watch file?
-			// XXX add file watch...
-			checkAndPublishDhcpLeases(&zedrouterCtx)
 
 			err = zedrouterCtx.cipherMetrics.Publish(
 				log, cipherMetricsPub, "global")
@@ -736,27 +691,108 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 				log.Errorln(err)
 			}
 
-			ps.CheckMaxTimeTopic(agentName, "PublishDhcpLeases", start,
+			ps.CheckMaxTimeTopic(agentName, "publishMetrics", start,
 				warningTime, errorTime)
+			// Check and remove stale flowlog publications.
+			checkFlowUnpublish(&zedrouterCtx)
 
-		case <-flowStatTimer.C:
-			start := time.Now()
-			log.Tracef("FlowStatTimer at %v", time.Now())
-			// XXX why start a new go routine for each change?
-			log.Functionf("Creating %s at %s", "FlowStatsCollect",
-				agentlog.GetMyStack())
-			go FlowStatsCollect(&zedrouterCtx)
-			ps.CheckMaxTimeTopic(agentName, "FlowStatsCollect", start,
-				warningTime, errorTime)
+		case flowUpdate := <-flowUpdates:
+			flowPublish(&zedrouterCtx, flowUpdate)
 
-		case <-zedrouterCtx.hostProbeTimer.C:
+		case ipAssignUpdates := <-ipAssignUpdates:
+			for _, ipAssignUpdate := range ipAssignUpdates {
+				vif := ipAssignUpdate.Prev.VIF
+				newAddrs := ipAssignUpdate.New
+				mac := vif.GuestIfMAC.String()
+				niKey := vif.NI.String()
+				netStatus := lookupNetworkInstanceStatus(&zedrouterCtx, niKey)
+				if netStatus == nil {
+					log.Errorf("Failed to get status for network instance %s "+
+						"(needed to update IPs assigned to VIF %s)",
+						niKey, vif.NetAdapterName)
+					continue
+				}
+				netStatus.IPAssignments[mac] = types.AssignedAddrs{
+					IPv4Addr:  newAddrs.IPv4Addr,
+					IPv6Addrs: newAddrs.IPv6Addrs,
+				}
+				publishNetworkInstanceStatus(&zedrouterCtx, netStatus)
+				switchNI := netStatus.Type == types.NetworkInstanceTypeSwitch
+				appKey := vif.App.String()
+				appStatus := lookupAppNetworkStatus(&zedrouterCtx, appKey)
+				if appStatus == nil {
+					log.Errorf("Failed to get network status for app %s "+
+						"(needed to update IPs assigned to VIF %s)",
+						appKey, vif.NetAdapterName)
+					continue
+				}
+				var ipv4Addr string
+				if newAddrs.IPv4Addr != nil {
+					ipv4Addr = newAddrs.IPv4Addr.String()
+				}
+				var ipv6Addrs []string
+				for _, ipv6Addr := range newAddrs.IPv6Addrs {
+					ipv6Addrs = append(ipv6Addrs, ipv6Addr.String())
+				}
+				for i := range appStatus.UnderlayNetworkList {
+					ulStatus := &appStatus.UnderlayNetworkList[i]
+					if ulStatus.Name != vif.NetAdapterName {
+						continue
+					}
+					if switchNI {
+						if ipv4Addr != "" {
+							ulStatus.AllocatedIPv4Addr = ipv4Addr
+						}
+						ulStatus.IPAddrMisMatch = false
+					} else {
+						if ulStatus.AllocatedIPv4Addr == "" {
+							ulStatus.AllocatedIPv4Addr = ipv4Addr
+							ulStatus.IPAddrMisMatch = false
+						} else if ulStatus.AllocatedIPv4Addr != ipv4Addr {
+							ulStatus.IPAddrMisMatch = true
+						}
+					}
+					ulStatus.AllocatedIPv6List = ipv6Addrs
+					ulStatus.IPv4Assigned = ipv4Addr != ""
+					break
+				}
+				publishAppNetworkStatus(&zedrouterCtx, appStatus)
+			}
+
+		case updates := <-probeUpdates:
 			start := time.Now()
-			log.Tracef("HostProbeTimer at %v", time.Now())
-			// launch the go function gateway/remote hosts probing check
-			log.Functionf("Creating %s at %s", "launchHostProbe",
-				agentlog.GetMyStack())
-			go launchHostProbe(&zedrouterCtx)
-			ps.CheckMaxTimeTopic(agentName, "lauchHostProbe", start,
+			log.Tracef("ProbeUpdates at %v", time.Now())
+			for _, probeUpdate := range updates {
+				niKey := probeUpdate.NetworkInstance.String()
+				item, err := zedrouterCtx.pubNetworkInstanceStatus.Get(niKey)
+				if err != nil {
+					log.Errorf("Failed to get status for network instance %s", niKey)
+					continue
+				}
+				status := item.(types.NetworkInstanceStatus)
+				ports := zedrouterCtx.deviceNetworkStatus.GetPortsByLogicallabel(
+					probeUpdate.SelectedUplinkLL)
+				if len(ports) != 1 {
+					log.Errorf("Label of selected uplink does not match single interface (%v)",
+						ports)
+					continue
+				}
+				status.SelectedUplinkIntf = ports[0].IfName
+				publishNetworkInstanceStatus(&zedrouterCtx, &status)
+				if status.ProgUplinkIntf == status.SelectedUplinkIntf {
+					log.Noticef("Uplink (%s) has not actually changed"+
+						" for network instance %s",
+						status.SelectedUplinkIntf, status.DisplayName)
+					continue
+				}
+				err = doNetworkInstanceFallback(&zedrouterCtx, &status)
+				if err != nil {
+					log.Errorf("Failed to perform network instance (%s) fallback: %v",
+						status.DisplayName, err)
+					continue
+				}
+			}
+			ps.CheckMaxTimeTopic(agentName, "probeUpdates", start,
 				warningTime, errorTime)
 
 		case <-zedrouterCtx.appNetCreateTimer.C:
@@ -764,13 +800,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			log.Tracef("appNetCreateTimer: at %v", time.Now())
 			scanAppNetworkStatusInErrorAndUpdate(&zedrouterCtx)
 			ps.CheckMaxTimeTopic(agentName, "scanAppNetworkStatus", start,
-				warningTime, errorTime)
-
-		case <-zedrouterCtx.checkNIUplinks:
-			start := time.Now()
-			log.Functionf("checkNIUplinks channel signal\n")
-			checkAndReprogramNetworkInstances(&zedrouterCtx)
-			ps.CheckMaxTimeTopic(agentName, "checkAndReprogram", start,
 				warningTime, errorTime)
 
 		case change := <-subNetworkInstanceConfig.MsgChan():
@@ -871,6 +900,7 @@ func handleAppNetworkConfigDelete(ctxArg interface{}, key string,
 
 	log.Functionf("handleAppNetworkConfigDelete(%s)\n", key)
 	ctx := ctxArg.(*zedrouterContext)
+	config := configArg.(types.AppNetworkConfig)
 	status := lookupAppNetworkStatus(ctx, key)
 	if status == nil {
 		log.Functionf("handleAppNetworkConfigDelete: unknown %s\n", key)
@@ -881,6 +911,7 @@ func handleAppNetworkConfigDelete(ctxArg interface{}, key string,
 	// on resource release, check whether any one else
 	// needs it
 	checkAppNetworkErrorAndStartTimer(ctx)
+	updateStateCollectingForApp(ctx, &config, nil)
 }
 
 // Callers must be careful to publish any changes to AppNetworkStatus
@@ -939,8 +970,6 @@ func lookupDiskStatusList(ctx *zedrouterContext, key string) []types.DiskStatus 
 	return domainStatus.DiskStatusList
 }
 
-var additionalInfoDevice *types.AdditionalInfoDevice
-
 func handleAppNetworkCreate(ctxArg interface{}, key string, configArg interface{}) {
 	ctx := ctxArg.(*zedrouterContext)
 	config := configArg.(types.AppNetworkConfig)
@@ -968,6 +997,7 @@ func handleAppNetworkCreate(ctxArg interface{}, key string, configArg interface{
 	appNumKey := types.UuidToNumKey{UUID: config.UUIDandVersion.UUID}
 	appNum, err := ctx.appNumAllocator.GetOrAllocate(appNumKey)
 	if err != nil {
+		status.PendingAdd = false
 		addError(ctx, &status, "handleAppNetworkCreate", err)
 		return
 	}
@@ -977,6 +1007,7 @@ func handleAppNetworkCreate(ctxArg interface{}, key string, configArg interface{
 	// allocate application numbers on underlay network
 	err = allocateAppIntfNums(ctx, config.UUIDandVersion.UUID, config.UnderlayNetworkList)
 	if err != nil {
+		status.PendingAdd = false
 		addError(ctx, &status, "handleAppNetworkCreate", err)
 		return
 	}
@@ -994,6 +1025,7 @@ func handleAppNetworkCreate(ctxArg interface{}, key string, configArg interface{
 	// on resource release, check whether any one else
 	// needs it
 	checkAppNetworkErrorAndStartTimer(ctx)
+	updateStateCollectingForApp(ctx, nil, &config)
 }
 
 func publishAppInstMetadata(ctx *zedrouterContext,
@@ -1036,6 +1068,23 @@ func lookupAppInstMetadata(ctx *zedrouterContext, key string) *types.AppInstMeta
 	}
 	appInstMetadata := st.(types.AppInstMetaData)
 	return &appInstMetadata
+}
+
+func flowPublish(ctx *zedrouterContext, flow types.IPFlow) {
+	flowKey := flow.Key()
+	ctx.flowPublishMap[flowKey] = time.Now()
+	ctx.pubAppFlowMonitor.Publish(flowKey, flow)
+}
+
+func checkFlowUnpublish(ctx *zedrouterContext) {
+	for k, m := range ctx.flowPublishMap {
+		passed := int64(time.Since(m) / time.Second)
+		if passed > flowStaleSec { // no update after 30 minutes, unpublish this flow
+			log.Functionf("checkFlowUnpublish: key %s, sec passed %d, remove", k, passed)
+			ctx.pubAppFlowMonitor.Unpublish(k)
+			delete(ctx.flowPublishMap, k)
+		}
+	}
 }
 
 func handleAppInstConfigDelete(ctxArg interface{}, key string, configArg interface{}) {
@@ -1123,6 +1172,51 @@ func appNetworkDoActivateAllUnderlayNetworks(
 		}
 	}
 	return nil
+}
+
+func compareIPVersion(a, b net.IP) bool {
+	return (a.To4() == nil) == (b.To4() == nil)
+}
+
+func checkIPRange(start, middle, end net.IP) {
+	if start == nil {
+		log.Warnf("no range check without start address")
+		return
+	}
+
+	if middle == nil && end == nil {
+		return
+	}
+	if middle == nil && end != nil {
+		if !compareIPVersion(start, end) {
+			log.Warnf("IPv6 and IPv4 mixed: %s, %s", start.String(), end.String())
+			return
+		}
+
+		if bytes.Compare(start, end) > 0 {
+			log.Warnf("start %s > end %s", start.String(), end.String())
+			return
+		}
+	}
+	if middle != nil && end != nil {
+		if !compareIPVersion(start, middle) || !compareIPVersion(middle, end) {
+			log.Warnf("IPv6 and IPv4 mixed: %s, %s, %s", start.String(), middle.String(), end.String())
+			return
+		}
+
+		if bytes.Compare(start, middle) > 0 {
+			log.Warnf("start %s > middle %s", start.String(), middle.String())
+			return
+		}
+		if bytes.Compare(start, end) > 0 {
+			log.Warnf("start %s > end %s", start.String(), end.String())
+			return
+		}
+		if bytes.Compare(middle, end) > 0 {
+			log.Warnf("middle %s > end %s", middle.String(), end.String())
+			return
+		}
+	}
 }
 
 func appNetworkDoActivateUnderlayNetwork(
@@ -1253,6 +1347,7 @@ func appNetworkDoActivateUnderlayNetwork(
 	setNetworkACLRules(ctx, appID, ulStatus.Name, ruleList)
 
 	if appIPAddr != "" {
+		checkIPRange(netInstStatus.DhcpRange.Start, net.ParseIP(appIPAddr), netInstStatus.DhcpRange.End)
 		// XXX clobber any IPv6 EID entry since same name
 		// but that's probably OK since we're doing IPv4 EIDs
 		addhostDnsmasq(bridgeName, appMac, appIPAddr,
@@ -1263,15 +1358,15 @@ func appNetworkDoActivateUnderlayNetwork(
 	newIpsets, staleIpsets, restartDnsmasq := diffIpsets(ipsets,
 		netInstStatus.BridgeIPSets)
 
-	if restartDnsmasq && ulStatus.BridgeIPAddr != "" {
+	if restartDnsmasq && !isEmptyIP(ulStatus.BridgeIPAddr) {
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netInstStatus.CurrentUplinkIntf)
+			netInstStatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netInstStatus.CurrentUplinkIntf)
+			netInstStatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netInstStatus, hostsDirpath,
-			newIpsets, netInstStatus.CurrentUplinkIntf,
+			newIpsets, netInstStatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -1309,7 +1404,7 @@ func generateAppMac(appUUID uuid.UUID, ulNum int, appNum int, netInstStatus *typ
 		appMac = fmt.Sprintf("02:16:3e:%02x:%02x:%02x",
 			hash[0], hash[1], hash[2])
 
-	case types.NetworkInstanceTypeLocal, types.NetworkInstanceTypeCloud:
+	case types.NetworkInstanceTypeLocal:
 		// Room to handle multiple underlays in 5th byte
 		appMac = fmt.Sprintf("00:16:3e:00:%02x:%02x",
 			ulNum, appNum)
@@ -1606,6 +1701,13 @@ func handleAppNetworkModify(ctxArg interface{}, key string,
 			}
 			appNetworkDoInactivateUnderlayNetwork(ctx, status,
 				ulStatus, ipsets)
+			err := ctx.niStateCollector.InactivateVIFStateCollecting(ulConfig.Network,
+				config.UUIDandVersion.UUID, ulConfig.Name)
+			if err != nil {
+				log.Errorf(
+					"handleAppNetworkModify: InactivateVIFStateCollecting failed for %s: %v",
+					config.DisplayName, err)
+			}
 
 			if ulConfig.Network != ulStatus.Network {
 				log.Functionf("checkAppNetworkModifyUNetAppNum(%v) for %s: change from %s to %s",
@@ -1624,13 +1726,21 @@ func handleAppNetworkModify(ctxArg interface{}, key string,
 			// Save new config
 			ulStatus.UnderlayNetworkConfig = *ulConfig
 
-			err := appNetworkDoActivateUnderlayNetwork(
+			err = appNetworkDoActivateUnderlayNetwork(
 				ctx, config, status, ipsets, ulConfig, ulNum)
 			if err != nil {
 				// addError already done
 				log.Errorf("handleAppNetworkModify: Underlay Network activation failed for %s: %v",
 					config.DisplayName, err)
 			}
+			err = ctx.niStateCollector.ActivateVIFStateCollecting(ulConfig.Network,
+				config.UUIDandVersion.UUID, ulConfig.Name)
+			if err != nil {
+				log.Errorf(
+					"handleAppNetworkModify: ActivateVIFStateCollecting failed for %s: %v",
+					config.DisplayName, err)
+			}
+
 		}
 	}
 
@@ -1646,6 +1756,7 @@ func handleAppNetworkModify(ctxArg interface{}, key string,
 	// on resource release, check whether any one else
 	// needs it
 	checkAppNetworkErrorAndStartTimer(ctx)
+	updateStateCollectingForApp(ctx, &oldConfig, &config)
 }
 
 func doAppNetworkSanityCheckForModify(ctx *zedrouterContext,
@@ -1739,16 +1850,16 @@ func doAppNetworkModifyUNetAcls(
 	newIpsets, staleIpsets, restartDnsmasq := diffIpsets(ipsets,
 		netstatus.BridgeIPSets)
 
-	if restartDnsmasq && ulStatus.BridgeIPAddr != "" {
+	if restartDnsmasq && !isEmptyIP(ulStatus.BridgeIPAddr) {
 		hostsDirpath := runDirname + "/hosts." + bridgeName
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netstatus, hostsDirpath,
-			newIpsets, netstatus.CurrentUplinkIntf,
+			newIpsets, netstatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -1819,6 +1930,14 @@ func doAppNetworkModifyUNetAppNum(
 		log.Error(err)
 		return err
 	}
+	// Did the freeAppIntfNum release any last reference?
+	netstatus := lookupNetworkInstanceStatus(ctx, ulStatus.Network.String())
+	if netstatus != nil {
+		if maybeNetworkInstanceDelete(ctx, netstatus) {
+			log.Functionf("post freeAppIntfNum(%v) for %s deleted %s",
+				oldNetworkID, appID, netstatus.Key())
+		}
+	}
 	return nil
 }
 
@@ -1871,7 +1990,7 @@ func handleDelete(ctx *zedrouterContext, key string,
 		netstatus := lookupNetworkInstanceStatus(ctx, ulStatus.Network.String())
 		if netstatus != nil {
 			if maybeNetworkInstanceDelete(ctx, netstatus) {
-				log.Functionf("post appNumsOnUNetFree(%v) for %s deleted %s",
+				log.Functionf("post freeAppIntfNums(%v) for %s deleted %s",
 					status.UUIDandVersion, status.DisplayName,
 					netstatus.Key())
 			}
@@ -1985,15 +2104,15 @@ func appNetworkDoInactivateUnderlayNetwork(
 	newIpsets, staleIpsets, restartDnsmasq := diffIpsets(ipsets,
 		netstatus.BridgeIPSets)
 
-	if restartDnsmasq && ulStatus.BridgeIPAddr != "" {
+	if restartDnsmasq && !isEmptyIP(ulStatus.BridgeIPAddr) {
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netstatus, hostsDirpath,
-			newIpsets, netstatus.CurrentUplinkIntf,
+			newIpsets, netstatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -2165,10 +2284,12 @@ func handleDNSImpl(ctxArg interface{}, key string,
 		status)
 	*ctx.deviceNetworkStatus = status
 	maybeHandleDNS(ctx)
-
-	deviceUpdateNIprobing(ctx, &status)
 	if changedDepend != nil {
 		updateACLIPAddr(ctx, changedDepend)
+	}
+
+	if ctx.uplinkProber != nil {
+		ctx.uplinkProber.ApplyDNSUpdate(status)
 	}
 
 	// Look for ports which disappeared

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -74,6 +75,10 @@ func parseConfig(getconfigCtx *getconfigContext, config *zconfig.EdgeDevConfig,
 
 	// XXX - DO NOT LOG entire config till secrets are in encrypted blobs
 	//log.Tracef("parseConfig: EdgeDevConfig: %v", *config)
+
+	// Prepare LOC structure before everything to be ready to
+	// publish info
+	parseLocConfig(getconfigCtx, config)
 
 	// Look for timers and other settings in configItems
 	// Process Config items even when configProcessingSkipFlag is set.
@@ -376,24 +381,6 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 	log.Functionf("Publish NetworkInstance Config: %+v", networkInstances)
 
 	unpublishDeletedNetworkInstanceConfig(ctx, networkInstances)
-	// check we do not have more than one VPN network instance
-	vpnCount := 0
-	for _, netInstApiCfg := range networkInstances {
-		if oCfg := netInstApiCfg.Cfg; oCfg != nil {
-			opaqueCfg := oCfg.GetOconfig()
-			if opaqueCfg != "" {
-				opaqueType := oCfg.GetType()
-				if opaqueType == zconfig.ZNetworkOpaqueConfigType_ZNetOConfigVPN {
-					vpnCount++
-				}
-			}
-		}
-	}
-
-	if vpnCount > 1 {
-		log.Errorf("publishNetworkInstanceConfig(): more than one VPN instance configuration")
-		return
-	}
 
 	for _, apiConfigEntry := range networkInstances {
 		id, err := uuid.FromString(apiConfigEntry.Uuidandversion.Uuid)
@@ -423,8 +410,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 		}
 		networkInstanceConfig.IpType = types.AddressType(apiConfigEntry.IpType)
 
-		switch networkInstanceConfig.Type {
-		case types.NetworkInstanceTypeSwitch:
+		if networkInstanceConfig.Type == types.NetworkInstanceTypeSwitch {
 			// XXX controller should send AddressTypeNone type for switch
 			// network instances
 			if networkInstanceConfig.IpType != types.AddressTypeNone {
@@ -438,33 +424,6 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			}
 			ctx.pubNetworkInstanceConfig.Publish(networkInstanceConfig.UUID.String(),
 				networkInstanceConfig)
-
-		// FIXME:XXX set encap flag, when the dummy interface
-		// is tested for the VPN
-		case types.NetworkInstanceTypeCloud:
-			// if opaque config not set, flag it
-			if apiConfigEntry.Cfg == nil {
-				log.Errorf("Network instance %s %s, %v, opaque not set",
-					networkInstanceConfig.UUID.String(),
-					networkInstanceConfig.DisplayName,
-					networkInstanceConfig.IpType)
-			} else {
-				ocfg := apiConfigEntry.Cfg
-				if ocfg.Type != zconfig.ZNetworkOpaqueConfigType_ZNetOConfigVPN {
-					log.Errorf("Network instance %s %s, %v invalid config",
-						networkInstanceConfig.UUID.String(),
-						networkInstanceConfig.DisplayName,
-						networkInstanceConfig.IpType)
-				}
-				networkInstanceConfig.OpaqueConfig = ocfg.Oconfig
-			}
-			// if not IPv4 type, flag it
-			if networkInstanceConfig.IpType != types.AddressTypeIPV4 {
-				log.Errorf("Network instance %s %s, %v not IPv4 type",
-					networkInstanceConfig.UUID.String(),
-					networkInstanceConfig.DisplayName,
-					networkInstanceConfig.IpType)
-			}
 		}
 
 		// other than switch-type(l2)
@@ -576,12 +535,17 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 		appInstance.FixedResources.EnableVnc = cfgApp.Fixedresources.EnableVnc
 		appInstance.FixedResources.VncDisplay = cfgApp.Fixedresources.VncDisplay
 		appInstance.FixedResources.VncPasswd = cfgApp.Fixedresources.VncPasswd
-		appInstance.FixedResources.DisableLogs = cfgApp.Fixedresources.DisableLogs
+		appInstance.DisableLogs = cfgApp.Fixedresources.DisableLogs
 		appInstance.MetaDataType = types.MetaDataType(cfgApp.MetaDataType)
 		appInstance.Delay = time.Duration(cfgApp.StartDelayInSeconds) * time.Second
 		appInstance.Service = cfgApp.Service
 		appInstance.CloudInitVersion = cfgApp.CloudInitVersion
 		appInstance.FixedResources.CPUsPinned = cfgApp.Fixedresources.PinCpu
+
+		// Parse the snapshot related fields
+		if cfgApp.Snapshot != nil {
+			parseSnapshotConfig(&appInstance.Snapshot, cfgApp.Snapshot)
+		}
 
 		appInstance.VolumeRefConfigList = make([]types.VolumeRefConfig,
 			len(cfgApp.VolumeRefList))
@@ -641,6 +605,24 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 
 		// Verify that it fits and if not publish with error
 		checkAndPublishAppInstanceConfig(getconfigCtx, appInstance)
+	}
+}
+
+func parseSnapshotConfig(appInstanceSnapshot *types.SnapshotConfig, cfgAppSnapshot *zconfig.SnapshotConfig) {
+	appInstanceSnapshot.ActiveSnapshot = cfgAppSnapshot.ActiveSnapshot
+	appInstanceSnapshot.MaxSnapshots = cfgAppSnapshot.MaxSnapshots
+	if cfgAppSnapshot.RollbackCmd != nil {
+		appInstanceSnapshot.RollbackCmd.ApplyTime = cfgAppSnapshot.RollbackCmd.OpsTime
+		appInstanceSnapshot.RollbackCmd.Counter = cfgAppSnapshot.RollbackCmd.Counter
+	}
+	appInstanceSnapshot.Snapshots = make([]types.SnapshotDesc, len(cfgAppSnapshot.Snapshots))
+	parseSnapshots(appInstanceSnapshot.Snapshots, cfgAppSnapshot.Snapshots)
+}
+
+func parseSnapshots(snapshots []types.SnapshotDesc, cfgSnapshots []*zconfig.SnapshotDesc) {
+	for i, cfgSnapshot := range cfgSnapshots {
+		snapshots[i].SnapshotID = cfgSnapshot.Id
+		snapshots[i].SnapshotType = types.SnapshotType(cfgSnapshot.Type)
 	}
 }
 
@@ -2510,6 +2492,27 @@ func parseOpCmds(getconfigCtx *getconfigContext,
 	reboot := scheduleDeviceOperation(getconfigCtx, config.GetReboot(), types.DeviceOperationReboot)
 	shutdown := scheduleDeviceOperation(getconfigCtx, config.GetShutdown(), types.DeviceOperationShutdown)
 	return reboot, shutdown
+}
+
+func isLocConfigValid(locConfig *zconfig.LOCConfig) bool {
+	if locConfig == nil || len(locConfig.LocUrl) == 0 {
+		return false
+	}
+	_, err := url.Parse(locConfig.LocUrl)
+	return err == nil
+}
+
+// parseLocConfig() - assign LOC config only if URL is valid
+func parseLocConfig(getconfigCtx *getconfigContext,
+	config *zconfig.EdgeDevConfig) {
+	locConfig := config.GetLocConfig()
+	if isLocConfigValid(locConfig) {
+		getconfigCtx.locConfig = &types.LOCConfig{
+			LocURL: locConfig.LocUrl,
+		}
+	} else {
+		getconfigCtx.locConfig = nil
+	}
 }
 
 func removeDeviceOpsCmdConfig(op types.DeviceOperation) {

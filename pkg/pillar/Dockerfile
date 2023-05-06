@@ -6,7 +6,7 @@ ARG BUILD_PKGS_BASE="git gcc linux-headers libc-dev make linux-pam-dev m4 findut
                      libintl libuuid libtirpc libblkid libcrypto1.1 zlib tar"
 
 # we use the same image in several places
-ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:b8b32c8353e50d7131d9ddc912581d14923806b0
+ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb
 
 FROM lfedge/eve-dom0-ztools:417d4ff6a57d2317c9e65166274b0ea6f6da16e2 as zfs
 RUN mkdir /out
@@ -40,19 +40,19 @@ RUN eve-alpine-deploy.sh
 # we need zfs files during build
 COPY --from=zfs / /
 
-# adjust TARGET_ARCH for cross-compiler
+# adjust EVE_TARGET_ARCH for cross-compiler
 FROM build-cross AS build-cross-target-arm64
-ENV TARGET_ARCH=aarch64
+ENV EVE_TARGET_ARCH=aarch64
 FROM build-cross AS build-cross-target-amd64
-ENV TARGET_ARCH=x86_64
+ENV EVE_TARGET_ARCH=x86_64
 
 # hadolint ignore=DL3006
 FROM build-cross-target-${TARGETARCH} AS build-cross-target
-ENV CROSS_COMPILE_ENV="${TARGET_ARCH}"-alpine-linux-musl-
+ENV CROSS_COMPILE_ENV="${EVE_TARGET_ARCH}"-alpine-linux-musl-
 COPY --from=cross-compilers /packages /packages
 # hadolint ignore=DL3018
-RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${TARGET_ARCH}"
-COPY --from=cross-compile-libs /out/ /usr/"${TARGET_ARCH}"-alpine-linux-musl/
+RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${EVE_TARGET_ARCH}"
+COPY --from=cross-compile-libs /out/ /usr/"${EVE_TARGET_ARCH}"-alpine-linux-musl/
 
 # cross-compilers
 FROM build-cross-target AS target-arm64-build-amd64
@@ -113,7 +113,6 @@ fi
 
 FROM lfedge/eve-fscrypt:0b7cc0d9d620e47fc54e21d56cb8a5cd224f9c9b as fscrypt
 FROM lfedge/eve-dnsmasq:3af908d86a95a627c729e09b1b125bf8de7fadcb as dnsmasq
-FROM lfedge/eve-strongswan:3f426e1c9fe2bbeb324a61c33b861c37459f616a as strongswan
 FROM lfedge/eve-gpt-tools:ab2e9f924e22709b4e08ebedd6d3c6a2882d071e as gpttools
 
 # collector collects everything together and then does any processing like stripping binaries.
@@ -142,7 +141,6 @@ COPY --from=zfs /out /out
 COPY --from=fscrypt /opt/zededa/bin /out/opt/zededa/bin
 COPY --from=gpttools / /out
 COPY --from=dnsmasq /usr/sbin/dnsmasq /out/opt/zededa/bin/dnsmasq
-COPY --from=strongswan / /out
 # we use final directory and move the line to the bottom
 # to avoid conflicts and speedup re-builds
 COPY --from=build /final /out

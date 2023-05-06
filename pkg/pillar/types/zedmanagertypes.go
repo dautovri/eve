@@ -40,6 +40,42 @@ type UUIDandVersion struct {
 	Version string
 }
 
+// SnapshotType type of the snapshot creation trigger
+// Must match the definition in appconfig.proto
+type SnapshotType int32
+
+const (
+	// SnapshotTypeUnspecified is the default value, and should not be used in practice
+	SnapshotTypeUnspecified SnapshotType = 0
+	// SnapshotTypeAppUpdate is used when the snapshot is created as a result of an app update
+	SnapshotTypeAppUpdate SnapshotType = 1
+)
+
+func (s SnapshotType) String() string {
+	switch s {
+	case SnapshotTypeUnspecified:
+		return "SnapshotTypeUnspecified"
+	case SnapshotTypeAppUpdate:
+		return "SnapshotTypeAppUpdate"
+	default:
+		return fmt.Sprintf("Unknown SnapshotType %d", s)
+	}
+}
+
+// SnapshotDesc a description of a snapshot instance
+type SnapshotDesc struct {
+	SnapshotID   string       // UUID of the snapshot
+	SnapshotType SnapshotType // Type of the snapshot creation trigger
+}
+
+// SnapshotConfig configuration of the snapshot handling for the app instance
+type SnapshotConfig struct {
+	ActiveSnapshot string            // UUID of the active snapshot used by the app instance
+	MaxSnapshots   uint32            // Number of snapshots that may be created for the app instance
+	RollbackCmd    AppInstanceOpsCmd // Command to roll back the app instance to the active snapshot
+	Snapshots      []SnapshotDesc    // List of snapshots known to the controller at the moment
+}
+
 // This is what we assume will come from the ZedControl for each
 // application instance. Note that we can have different versions
 // configured for the same UUID, hence the key is the UUIDandVersion
@@ -55,6 +91,7 @@ type AppInstanceConfig struct {
 	//	so the cloud gets it.
 	Errors              []string
 	FixedResources      VmConfig // CPU etc
+	DisableLogs         bool
 	VolumeRefConfigList []VolumeRefConfig
 	Activate            bool //EffectiveActivate in AppInstanceStatus must be used for the actual activation
 	UnderlayNetworkList []UnderlayNetworkConfig
@@ -86,6 +123,10 @@ type AppInstanceConfig struct {
 	// All changes to the cloud-init config are tracked using this version field -
 	// once the version is changed cloud-init tool restarts in a guest.
 	CloudInitVersion uint32
+
+	// Contains the configuration of the snapshot handling for the app instance.
+	// Meanwhile, the list of actual snapshots is stored in the AppInstanceStatus.
+	Snapshot SnapshotConfig
 }
 
 type AppInstanceOpsCmd struct {

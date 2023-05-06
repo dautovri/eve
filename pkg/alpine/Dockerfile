@@ -1,6 +1,6 @@
 # image was bootstraped using FROM lfedge/eve-alpine-base:f11c7a5dcffe1ab7b466bea7e26010a27da62b3b AS cache
 # to update please see https://github.com/lf-edge/eve/blob/master/docs/BUILD.md#how-to-update-eve-alpine-package
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 AS cache
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb AS cache
 
 ARG ALPINE_VERSION=3.16
 # this is only needed once, when this package
@@ -17,11 +17,13 @@ COPY build-cache.sh /bin/
 RUN apk add --no-cache abuild gcc sudo
 
 # install a new key into /etc/apk/keys
+# hadolint ignore=DL3059
 RUN abuild-keygen -a -i -n
 
 # create all the mirrors
 WORKDIR /tmp/mirrors
 RUN [ -f /etc/apk/repositories.upstream ] || mv /etc/apk/repositories /etc/apk/repositories.upstream
+# hadolint ignore=DL3059
 RUN [ -f /etc/apk/cache.url ] || echo https://dl-cdn.alpinelinux.org/alpine > /etc/apk/cache.url
 RUN for repo in main community testing; do \
       for p in */"$repo"; do \
@@ -33,9 +35,11 @@ RUN for repo in main community testing; do \
     done
 
 # set the default repository to use
-RUN cp /mirror/${ALPINE_VERSION}/rootfs/etc/apk/repositories /etc/apk && apk update
+RUN cp /mirror/${ALPINE_VERSION}/rootfs/etc/apk/repositories /etc/apk
+RUN cat /mirror/edge/rootfs/etc/apk/repositories >> /etc/apk/repositories
+RUN apk update
 
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 as compactor
+FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 AS compactor
 
 COPY --from=cache /etc/apk/repositories* /etc/apk/
 COPY --from=cache /etc/apk/keys /etc/apk/keys/

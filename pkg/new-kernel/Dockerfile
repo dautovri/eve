@@ -4,10 +4,10 @@ ARG BUILD_PKGS_BASE="argp-standalone automake bash bc binutils-dev bison build-b
                      diffutils flex git gmp-dev gnupg installkernel kmod elfutils-dev    \
                      linux-headers libunwind-dev mpc1-dev mpfr-dev ncurses-dev findutils \
                      openssl-dev patch rsync sed squashfs-tools tar xz xz-dev zlib-dev openssl \
-                     attr-dev autoconf file coreutils libtirpc-dev libtool util-linux-dev"
+                     attr-dev autoconf file coreutils libtirpc-dev libtool util-linux-dev python3"
 
 # we use the same image in several places
-ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:b8b32c8353e50d7131d9ddc912581d14923806b0
+ARG EVE_ALPINE_IMAGE=lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb
 
 # hadolint ignore=DL3006
 FROM ${EVE_ALPINE_IMAGE} as kernel-build-base-native
@@ -29,20 +29,20 @@ FROM ${EVE_ALPINE_IMAGE} AS cross-compile-libs
 ENV PKGS musl-dev libgcc
 RUN eve-alpine-deploy.sh
 
-# adjust TARGET_ARCH for cross-compiler
+# adjust EVE_TARGET_ARCH for cross-compiler
 FROM kernel-build-base-cross AS kernel-cross-target-arm64
-ENV TARGET_ARCH=aarch64
+ENV EVE_TARGET_ARCH=aarch64
 FROM kernel-build-base-cross AS kernel-cross-target-riscv64
-ENV TARGET_ARCH=riscv64
+ENV EVE_TARGET_ARCH=riscv64
 
 # install cross-compile packages and libs for target
 # hadolint ignore=DL3006
 FROM kernel-cross-target-${TARGETARCH} AS kernel-cross-build-target
-ENV CROSS_COMPILE_ENV="${TARGET_ARCH}"-alpine-linux-musl-
+ENV CROSS_COMPILE_ENV="${EVE_TARGET_ARCH}"-alpine-linux-musl-
 COPY --from=cross-compilers /packages /packages
 # hadolint ignore=DL3018
-RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${TARGET_ARCH}"
-COPY --from=cross-compile-libs /out/ /usr/"${TARGET_ARCH}"-alpine-linux-musl/
+RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${EVE_TARGET_ARCH}"
+COPY --from=cross-compile-libs /out/ /usr/"${EVE_TARGET_ARCH}"-alpine-linux-musl/
 
 # support cross compile from amd64 and arm64 for now
 FROM kernel-cross-build-target AS kernel-target-arm64-build-amd64
@@ -94,10 +94,9 @@ ENV KERNEL_DEFCONFIG=defconfig
 # hadolint ignore=DL3006
 FROM kernel-target-${TARGETARCH} AS kernel-build
 
-# We copy the entire directory. This copies some unneeded files, but
-# allows us to check for the existence /patches-${KERNEL_SERIES} to
-# build kernels without patches.
-COPY / /
+COPY /kernel-config/* /
+COPY /patches-5.15.x /patches-5.15.x
+COPY /patches-zfs-2.1.2 /patches-zfs-2.1.2
 
 ARG KERNEL_SOURCE=https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz
 ARG KERNEL_SHA256_SUMS=https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/sha256sums.asc
@@ -136,7 +135,7 @@ RUN set -e ; KERNEL_SERIES="${KERNEL_VERSION%.*}".x; \
 # hadolint ignore=SC2086
 RUN KERNEL_DEF_CONF="/linux/arch/${KERNEL_ARCH}/configs/${KERNEL_DEFCONFIG}"; \
     KERNEL_SERIES="${KERNEL_VERSION%.*}".x; \
-    cp /kernel_config-"${KERNEL_SERIES}"-"${TARGET_ARCH}" "${KERNEL_DEF_CONF}"; \
+    cp /kernel_config-"${KERNEL_SERIES}"-"${EVE_TARGET_ARCH}" "${KERNEL_DEF_CONF}"; \
     if [ -n "${EXTRA}" ]; then \
         sed -i "s/CONFIG_LOCALVERSION=\"-linuxkit\"/CONFIG_LOCALVERSION=\"-linuxkit${EXTRA}\"/" "${KERNEL_DEF_CONF}"; \
         if [ "${EXTRA}" = "-dbg" ]; then \
@@ -149,7 +148,51 @@ RUN KERNEL_DEF_CONF="/linux/arch/${KERNEL_ARCH}/configs/${KERNEL_DEFCONFIG}"; \
     cp "${KERNEL_DEF_CONF}" .config.new && \
     make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" prepare
 
-# Prepare built-in ZFS
+# Verify kconfig after `make prepare` call
+WORKDIR /linux
+RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" "${KERNEL_DEFCONFIG}"
+RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig
+# diffconfig returns 0 in all cases, grep to throw error in a case config has changed between build stages.
+RUN ! scripts/diffconfig .config .config.new | grep .
+
+# To have a reproducible kernel build
+ARG KBUILD_BUILD_TIMESTAMP
+ARG KBUILD_BUILD_USER
+ARG KBUILD_BUILD_HOST
+ARG KCONFIG_NOTIMESTAMP
+ARG SOURCE_DATE_EPOCH
+ENV KBUILD_BUILD_TIMESTAMP=${KBUILD_BUILD_TIMESTAMP}
+ENV KBUILD_BUILD_USER=${KBUILD_BUILD_USER}
+ENV KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST}
+ENV KCONFIG_NOTIMESTAMP=${KCONFIG_NOTIMESTAMP}
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+RUN sed -i Makefile -e 's/--build-id=sha1/--build-id=none/g'
+
+# Make kernel
+RUN make -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" KCFLAGS="-fno-pie" && \
+    case ${EVE_TARGET_ARCH} in \
+    x86_64) \
+        cp arch/x86_64/boot/bzImage /out/kernel; \
+        ;; \
+    aarch64) \
+        cp arch/arm64/boot/Image.gz /out/kernel; \
+        ;; \
+    riscv64) \
+        cp arch/riscv/boot/Image.gz /out/kernel; \
+        ;; \
+    esac && \
+    cp System.map /out && \
+    DVER=$(make kernelrelease) && \
+    DIR=linux-debug-$DVER && \
+    rsync -rv --include '*/' --include '*.dwo' --exclude '*' --prune-empty-dirs . /tmp/$DIR && \
+    cp vmlinux /tmp/$DIR && \
+    tar -cf /out/kernel-debug.tar -C /tmp $DIR
+
+# Modules
+RUN make -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
+
+
+# Out-of-tree, open source modules
 #  * ZFS on Linux
 ENV ZFS_VERSION=2.1.2
 ENV ZFS_COMMIT=zfs-${ZFS_VERSION}
@@ -174,41 +217,11 @@ RUN set -e; \
 RUN ./autogen.sh && \
     CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" ./configure \
         --with-linux=/linux \
-        --with-linux-obj=/linux \
-        --with-config=kernel  \
-        --enable-linux-builtin  \
-        --host="${TARGET_ARCH}"-linux-musl --build="${BUILD_ARCH}"-linux-musl && \
+        --host="${EVE_TARGET_ARCH}"-linux-musl --build="${EVE_BUILD_ARCH}"-linux-musl && \
     ./scripts/make_gitrev.sh && \
-    ./copy-builtin /linux
+    make -C module -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" && \
+    make -C module INSTALL_MOD_PATH=/tmp/kernel-modules install
 
-# Verify kconfig after ZFS is prepared as built-in
-WORKDIR /linux
-RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" "${KERNEL_DEFCONFIG}" && \
-    make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig && \
-    diff -cw .config .config.new
-
-# Make kernel
-RUN make -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" KCFLAGS="-fno-pie" && \
-    case ${TARGET_ARCH} in \
-    x86_64) \
-        cp arch/x86_64/boot/bzImage /out/kernel; \
-        ;; \
-    aarch64) \
-        cp arch/arm64/boot/Image.gz /out/kernel; \
-        ;; \
-    riscv64) \
-        cp arch/riscv/boot/Image.gz /out/kernel; \
-        ;; \
-    esac && \
-    cp System.map /out && \
-    DVER=$(make kernelrelease) && \
-    DIR=linux-debug-$DVER && \
-    rsync -rv --include '*/' --include '*.dwo' --exclude '*' --prune-empty-dirs . /tmp/$DIR && \
-    cp vmlinux /tmp/$DIR && \
-    tar -cf /out/kernel-debug.tar -C /tmp $DIR
-
-# Modules
-RUN make -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
 
 # Out-of-tree, creepy modules
 WORKDIR /tmp/rtl8821CU
@@ -217,7 +230,7 @@ RUN tar -zxvf /tmp/rtl8821CU.tgz --strip-components=1 && \
     rm /tmp/rtl8821CU.tgz
 
 WORKDIR /linux
-RUN if [ "${TARGET_ARCH}" != riscv64 ]; then \
+RUN if [ "${EVE_TARGET_ARCH}" != riscv64 ]; then \
         make -j "$(getconf _NPROCESSORS_ONLN)" -C /tmp/rtl8821CU KSRC=/linux CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" modules && \
         install -D -p -m 644 /tmp/rtl8821CU/8821cu.ko $(echo /tmp/kernel-modules/lib/modules/*)/kernel/drivers/net/wireless/realtek/rtl8821cu/8821cu.ko ;\
     fi
@@ -225,12 +238,19 @@ RUN if [ "${TARGET_ARCH}" != riscv64 ]; then \
 WORKDIR /linux
 
 # Strip at least some of the modules to conserve space
-RUN [ "${TARGET_ARCH}" = x86_64 ] || "${CROSS_COMPILE_ENV}strip" --strip-debug `find /tmp/kernel-modules/lib/modules -name \*.ko`
+RUN [ "${EVE_TARGET_ARCH}" = x86_64 ] || "${CROSS_COMPILE_ENV}strip" --strip-debug `find /tmp/kernel-modules/lib/modules -name \*.ko`
 
 # Device Tree Blobs
-RUN [ "${TARGET_ARCH}" = x86_64 ] || make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" dtbs_install
+RUN [ "${EVE_TARGET_ARCH}" = x86_64 ] || make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" dtbs_install
+
+# copy build time gnerated module-signing public key, used for diffing builds
+RUN DVER=$(basename "$(find /tmp/kernel-modules/lib/modules/ -mindepth 1 -maxdepth 1)"); \
+    if [ -f "/linux/certs/signing_key.x509" ]; then \
+        cp /linux/certs/signing_key.x509 "/tmp/kernel-modules/lib/modules/$DVER"; \
+    fi
 
 # Package all the modules up
+# hadolint ignore=SC2086
 RUN ( DVER=$(basename $(find /tmp/kernel-modules/lib/modules/ -mindepth 1 -maxdepth 1)) && \
       cd /tmp/kernel-modules/lib/modules/$DVER && \
       rm build source && \

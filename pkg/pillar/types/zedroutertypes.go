@@ -135,6 +135,20 @@ func (status AppNetworkStatus) AwaitingNetwork() bool {
 	return status.AwaitNetworkInstance
 }
 
+// GetULStatusForNI returns UnderlayNetworkStatus for every application VIF
+// connected to the given network instance (there can be multiple interfaces connected
+// to the same network instance).
+func (status AppNetworkStatus) GetULStatusForNI(netUUID uuid.UUID) []*UnderlayNetworkStatus {
+	var uls []*UnderlayNetworkStatus
+	for i := range status.UnderlayNetworkList {
+		ul := &status.UnderlayNetworkList[i]
+		if ul.Network == netUUID {
+			uls = append(uls, ul)
+		}
+	}
+	return uls
+}
+
 // Indexed by UUID
 type AppNetworkStatus struct {
 	UUIDandVersion UUIDandVersion
@@ -1423,12 +1437,36 @@ func (status *DeviceNetworkStatus) GetPortByIfName(
 	return nil
 }
 
-// GetPortByLogicallabel - Get Port Status for port with given label
-func (status *DeviceNetworkStatus) GetPortByLogicallabel(
-	label string) *NetworkPortStatus {
+// GetPortsByLogicallabel - Get Port Status for all ports matching the given label.
+func (status *DeviceNetworkStatus) GetPortsByLogicallabel(
+	label string) (ports []*NetworkPortStatus) {
+	// Check for shared labels first.
+	switch label {
+	case UplinkLabel:
+		for i := range status.Ports {
+			if status.Version >= DPCIsMgmt && !status.Ports[i].IsMgmt {
+				continue
+			}
+			ports = append(ports, &status.Ports[i])
+		}
+		return ports
+	case FreeUplinkLabel:
+		for i := range status.Ports {
+			if status.Version >= DPCIsMgmt && !status.Ports[i].IsMgmt {
+				continue
+			}
+			if status.Ports[i].Cost > 0 {
+				continue
+			}
+			ports = append(ports, &status.Ports[i])
+		}
+		return ports
+	}
+	// Label is referencing single port.
 	for i := range status.Ports {
 		if status.Ports[i].Logicallabel == label {
-			return &status.Ports[i]
+			ports = append(ports, &status.Ports[i])
+			return ports
 		}
 	}
 	return nil
@@ -1995,55 +2033,6 @@ const (
 	MST_LAST = 255
 )
 
-// CurrIntfStatusType - enum for probe current uplink intf UP/Down status
-type CurrIntfStatusType uint8
-
-// CurrentIntf status
-const (
-	CurrIntfNone CurrIntfStatusType = iota
-	CurrIntfDown
-	CurrIntfUP
-)
-
-// ServerProbe - remote probe info configured from the cloud
-type ServerProbe struct {
-	ServerURL     string // include method,host,paths
-	ServerIP      net.IP
-	ProbeInterval uint32 // probe frequency in seconds
-}
-
-// ProbeInfo - per phyical port probing info
-type ProbeInfo struct {
-	IfName    string
-	IsPresent bool // for GC purpose
-	TransDown bool // local up long time, transition to down
-	// local nexthop probe state
-	GatewayUP  bool // local nexthop is in UP state
-	LocalAddr  net.IP
-	NhAddr     net.IP
-	FailedCnt  uint32 // continuous ping fail count, reset when ping success
-	SuccessCnt uint32 // contiguous ping success count, reset when ping fail
-
-	Cost uint8
-	// remote host probe state
-	RemoteHostUP    bool   // remote host is in UP state
-	FailedProbeCnt  uint32 // continuous remote ping fail count, reset when ping success
-	SuccessProbeCnt uint32 // continuous remote ping success count, reset when ping fail
-	AveLatency      int64  // average delay in msec
-}
-
-// NetworkInstanceProbeStatus - probe status per network instance
-type NetworkInstanceProbeStatus struct {
-	PConfig           ServerProbe          // user configuration for remote server
-	NeedIntfUpdate    bool                 // flag to indicate the CurrentUpLinkIntf status has changed
-	PrevUplinkIntf    string               // previously used uplink interface
-	CurrentUplinkIntf string               // decided by local/remote probing
-	ProgUplinkIntf    string               // Currently programmed uplink interface for app traffic
-	CurrIntfUP        CurrIntfStatusType   // the current picked interface can be up or down
-	TriggerCnt        uint32               // number of times Uplink change triggered
-	PInfo             map[string]ProbeInfo // per physical port eth0, eth1 probing state
-}
-
 type DhcpType uint8
 
 const (
@@ -2080,7 +2069,7 @@ type UnderlayNetworkStatus struct {
 	ACLs int // drop ACLs field from UnderlayNetworkConfig
 	VifInfo
 	BridgeMac         net.HardwareAddr
-	BridgeIPAddr      string   // The address for DNS/DHCP service in zedrouter
+	BridgeIPAddr      net.IP   // The address for DNS/DHCP service in zedrouter
 	AllocatedIPv4Addr string   // Assigned to domU
 	AllocatedIPv6List []string // IPv6 addresses assigned to domU
 	IPv4Assigned      bool     // Set to true once DHCP has assigned it to domU
@@ -2226,7 +2215,7 @@ type AssignedAddrs struct {
 type NetworkInstanceInfo struct {
 	BridgeNum     int
 	BridgeName    string // bn<N>
-	BridgeIPAddr  string
+	BridgeIPAddr  net.IP
 	BridgeMac     string
 	BridgeIfindex int
 
@@ -2258,7 +2247,7 @@ type NetworkInstanceInfo struct {
 	NumTrunkPorts uint32
 
 	// IP address on which the meta-data server listens
-	MetaDataServerIP string
+	MetaDataServerIP net.IP
 }
 
 func (instanceInfo *NetworkInstanceInfo) IsVifInBridge(
@@ -2311,26 +2300,12 @@ func (instanceInfo *NetworkInstanceInfo) AddVif(log *base.LogObject,
 	instanceInfo.Vifs = append(instanceInfo.Vifs, info)
 }
 
-type NetworkServiceType uint8
-
-const (
-	NST_FIRST NetworkServiceType = iota
-	NST_STRONGSWAN
-	NST_LISP
-	NST_BRIDGE
-	NST_NAT // Default?
-	NST_LB  // What is this?
-	// XXX Add a NST_L3/NST_ROUTER to describe IP forwarding?
-	NST_LAST = 255
-)
-
 type NetworkInstanceMetrics struct {
 	UUIDandVersion UUIDandVersion
 	DisplayName    string
 	Type           NetworkInstanceType
 	NetworkMetrics NetworkMetrics
 	ProbeMetrics   ProbeMetrics
-	VpnMetrics     *VpnMetrics
 	VlanMetrics    VlanMetrics
 }
 
@@ -2342,25 +2317,25 @@ type VlanMetrics struct {
 
 // ProbeMetrics - NI probe metrics
 type ProbeMetrics struct {
-	CurrUplinkIntf  string             // the uplink interface probing picks
-	RemoteEndpoint  string             // remote either URL or IP address
-	LocalPingIntvl  uint32             // local ping interval in seconds
-	RemotePingIntvl uint32             // remote probing interval in seconds
-	UplinkNumber    uint32             // number of possible uplink interfaces
-	IntfProbeStats  []ProbeIntfMetrics // per dom0 intf uplink probing metrics
+	SelectedUplinkIntf string             // the uplink interface that probing picked
+	RemoteEndpoints    []string           // remote IP/URL addresses used for probing
+	LocalPingIntvl     uint32             // local ping interval in seconds
+	RemotePingIntvl    uint32             // remote probing interval in seconds
+	UplinkCount        uint32             // number of possible uplink interfaces
+	IntfProbeStats     []ProbeIntfMetrics // per dom0 intf uplink probing metrics
 }
 
 // ProbeIntfMetrics - per dom0 network uplink interface probing
 type ProbeIntfMetrics struct {
-	IntfName        string // dom0 uplink interface name
-	NexthopGw       net.IP // interface local ping nexthop address
-	GatewayUP       bool   // Is local gateway in UP status
-	RmoteStatusUP   bool   // Is remote endpoint in UP status
-	GatewayUPCnt    uint32 // local ping UP count
-	GatewayDownCnt  uint32 // local ping DOWN count
-	RemoteUPCnt     uint32 // remote probe UP count
-	RemoteDownCnt   uint32 // remote probe DOWN count
-	LatencyToRemote uint32 // probe latency to remote in msec
+	IntfName        string   // dom0 uplink interface name
+	NexthopIPs      []net.IP // interface local next-hop address(es) used for probing
+	NexthopUP       bool     // Is local next-hop in UP status
+	RemoteUP        bool     // Is remote endpoint in UP status
+	NexthopUPCnt    uint32   // local ping UP count
+	NexthopDownCnt  uint32   // local ping DOWN count
+	RemoteUPCnt     uint32   // remote probe UP count
+	RemoteDownCnt   uint32   // remote probe DOWN count
+	LatencyToRemote uint32   // probe latency to remote in msec
 }
 
 func (metrics NetworkInstanceMetrics) Key() string {
@@ -2592,6 +2567,44 @@ func (config *NetworkInstanceConfig) IsIPv6() bool {
 	return false
 }
 
+// WithUplinkProbing returns true if the network instance is eligible for uplink
+// probing (see pkg/pillar/uplinkprober).
+// Uplink probing is performed only for L3 networks with non-empty "shared" uplink
+// label, matching a subset of uplink ports.
+// Even if a network instance is eligible for probing as determined by this method,
+// the actual process of connectivity probing may still be inactive if there are
+// no uplink ports available that match the label.
+func (config *NetworkInstanceConfig) WithUplinkProbing() bool {
+	switch config.Type {
+	case NetworkInstanceTypeLocal:
+		return IsSharedPortLabel(config.Logicallabel)
+	default:
+		return false
+	}
+}
+
+const (
+	// UplinkLabel references all management interfaces.
+	UplinkLabel = "uplink"
+	// FreeUplinkLabel references all management interfaces with 0 cost.
+	FreeUplinkLabel = "freeuplink"
+)
+
+// IsSharedPortLabel : returns true if the logical label references multiple
+// ports.
+// Currently used labels are:
+//   - "uplink": any management interface
+//   - "freeuplink": any management interface with 0 cost
+func IsSharedPortLabel(label string) bool {
+	switch label {
+	case UplinkLabel:
+		return true
+	case FreeUplinkLabel:
+		return true
+	}
+	return false
+}
+
 type ChangeInProgressType int32
 
 const (
@@ -2621,10 +2634,8 @@ type NetworkInstanceStatus struct {
 
 	NetworkInstanceInfo
 
-	OpaqueStatus string
-	VpnStatus    *VpnStatus
-
-	NetworkInstanceProbeStatus
+	SelectedUplinkIntf string // Decided by local/remote probing
+	ProgUplinkIntf     string // Currently programmed uplink interface for app traffic
 }
 
 // LogCreate :
@@ -2677,7 +2688,7 @@ type AppNetworkACLArgs struct {
 	IPVer      int
 	BridgeName string
 	VifName    string
-	BridgeIP   string
+	BridgeIP   net.IP
 	AppIP      string
 	UpLinks    []string // List of ifnames
 	NIType     NetworkInstanceType
@@ -2715,9 +2726,10 @@ type IPTablesRuleList []IPTablesRule
  * on all member virtual interface including the bridge.
  */
 func (status *NetworkInstanceStatus) UpdateNetworkMetrics(log *base.LogObject,
-	nms *NetworkMetrics) *NetworkMetric {
+	nms *NetworkMetrics) (brNetMetric *NetworkMetric) {
 
-	netMetric := NetworkMetric{IfName: status.BridgeName}
+	brNetMetric = &NetworkMetric{IfName: status.BridgeName}
+	status.VifMetricMap = make(map[string]NetworkMetric) // clear previous metrics
 	for _, vif := range status.Vifs {
 		metric, found := nms.LookupNetworkMetrics(vif.Name)
 		if !found {
@@ -2728,20 +2740,20 @@ func (status *NetworkInstanceStatus) UpdateNetworkMetrics(log *base.LogObject,
 		status.VifMetricMap[vif.Name] = metric
 	}
 	for _, metric := range status.VifMetricMap {
-		netMetric.TxBytes += metric.TxBytes
-		netMetric.RxBytes += metric.RxBytes
-		netMetric.TxPkts += metric.TxPkts
-		netMetric.RxPkts += metric.RxPkts
-		netMetric.TxErrors += metric.TxErrors
-		netMetric.RxErrors += metric.RxErrors
-		netMetric.TxDrops += metric.TxDrops
-		netMetric.RxDrops += metric.RxDrops
-		netMetric.TxAclDrops += metric.TxAclDrops
-		netMetric.RxAclDrops += metric.RxAclDrops
-		netMetric.TxAclRateLimitDrops += metric.TxAclRateLimitDrops
-		netMetric.RxAclRateLimitDrops += metric.RxAclRateLimitDrops
+		brNetMetric.TxBytes += metric.TxBytes
+		brNetMetric.RxBytes += metric.RxBytes
+		brNetMetric.TxPkts += metric.TxPkts
+		brNetMetric.RxPkts += metric.RxPkts
+		brNetMetric.TxErrors += metric.TxErrors
+		brNetMetric.RxErrors += metric.RxErrors
+		brNetMetric.TxDrops += metric.TxDrops
+		brNetMetric.RxDrops += metric.RxDrops
+		brNetMetric.TxAclDrops += metric.TxAclDrops
+		brNetMetric.RxAclDrops += metric.RxAclDrops
+		brNetMetric.TxAclRateLimitDrops += metric.TxAclRateLimitDrops
+		brNetMetric.RxAclRateLimitDrops += metric.RxAclRateLimitDrops
 	}
-	return &netMetric
+	return brNetMetric
 }
 
 /*
@@ -2844,182 +2856,6 @@ type ACEAction struct {
 	TargetPort int  // Internal port
 }
 
-// Retrieved from geolocation service for device underlay connectivity
-type AdditionalInfoDevice struct {
-	UnderlayIP string
-	Hostname   string `json:",omitempty"` // From reverse DNS
-	City       string `json:",omitempty"`
-	Region     string `json:",omitempty"`
-	Country    string `json:",omitempty"`
-	Loc        string `json:",omitempty"` // Lat and long as string
-	Org        string `json:",omitempty"` // From AS number
-}
-
-// Tie the Application EID back to the device
-type AdditionalInfoApp struct {
-	DisplayName string
-	DeviceEID   net.IP
-	DeviceIID   uint32
-	UnderlayIP  string
-	Hostname    string `json:",omitempty"` // From reverse DNS
-}
-
-// Input Opaque Config
-type StrongSwanConfig struct {
-	VpnRole          string
-	PolicyBased      bool
-	IsClient         bool
-	VpnGatewayIpAddr string
-	VpnSubnetBlock   string
-	VpnLocalIpAddr   string
-	VpnRemoteIpAddr  string
-	PreSharedKey     string
-	LocalSubnetBlock string
-	ClientConfigList []VpnClientConfig
-}
-
-// structure for internal handling
-type VpnConfig struct {
-	VpnRole          string
-	PolicyBased      bool
-	IsClient         bool
-	PortConfig       NetLinkConfig
-	AppLinkConfig    NetLinkConfig
-	GatewayConfig    NetLinkConfig
-	ClientConfigList []VpnClientConfig
-}
-
-type NetLinkConfig struct {
-	IfName      string
-	IpAddr      string
-	SubnetBlock string
-}
-
-type VpnClientConfig struct {
-	IpAddr       string
-	SubnetBlock  string
-	PreSharedKey string
-	TunnelConfig VpnTunnelConfig
-}
-
-type VpnTunnelConfig struct {
-	Name         string
-	Key          string
-	Mtu          string
-	Metric       string
-	LocalIpAddr  string
-	RemoteIpAddr string
-}
-
-type VpnState uint8
-
-const (
-	VPN_INVALID VpnState = iota
-	VPN_INITIAL
-	VPN_CONNECTING
-	VPN_ESTABLISHED
-	VPN_INSTALLED
-	VPN_REKEYED
-	VPN_DELETED  VpnState = 10
-	VPN_MAXSTATE VpnState = 255
-)
-
-type VpnLinkInfo struct {
-	SubNet    string // connecting subnet
-	SpiId     string // security parameter index
-	Direction bool   // 0 - in, 1 - out
-	PktStats  PktStats
-}
-
-type VpnLinkStatus struct {
-	Id         string
-	Name       string
-	ReqId      string
-	InstTime   uint64 // installation time
-	ExpTime    uint64 // expiry time
-	RekeyTime  uint64 // rekey time
-	EspInfo    string
-	State      VpnState
-	LInfo      VpnLinkInfo
-	RInfo      VpnLinkInfo
-	MarkDelete bool
-}
-
-type VpnEndPoint struct {
-	Id     string // ipsec id
-	IpAddr string // end point ip address
-	Port   uint32 // udp port
-}
-
-type VpnConnStatus struct {
-	Id         string   // ipsec connection id
-	Name       string   // connection name
-	State      VpnState // vpn state
-	Version    string   // ike version
-	Ikes       string   // ike parameters
-	EstTime    uint64   // established time
-	ReauthTime uint64   // reauth time
-	LInfo      VpnEndPoint
-	RInfo      VpnEndPoint
-	Links      []*VpnLinkStatus
-	StartLine  uint32
-	EndLine    uint32
-	MarkDelete bool
-}
-
-type VpnStatus struct {
-	Version            string    // strongswan package version
-	UpTime             time.Time // service start time stamp
-	IpAddrs            string    // listening ip addresses, can be multiple
-	ActiveVpnConns     []*VpnConnStatus
-	StaleVpnConns      []*VpnConnStatus
-	ActiveTunCount     uint32
-	ConnectingTunCount uint32
-	PolicyBased        bool
-}
-
-type PktStats struct {
-	Pkts  uint64
-	Bytes uint64
-}
-
-type LinkPktStats struct {
-	InPkts  PktStats
-	OutPkts PktStats
-}
-
-type VpnLinkMetrics struct {
-	SubNet string // connecting subnet
-	SpiId  string // security parameter index
-}
-
-type VpnEndPointMetrics struct {
-	IpAddr   string // end point ip address
-	LinkInfo VpnLinkMetrics
-	PktStats PktStats
-}
-
-type VpnConnMetrics struct {
-	Id        string // ipsec connection id
-	Name      string // connection name
-	EstTime   uint64 // established time
-	Type      NetworkServiceType
-	NIType    NetworkInstanceType
-	LEndPoint VpnEndPointMetrics
-	REndPoint VpnEndPointMetrics
-}
-
-type VpnMetrics struct {
-	UpTime     time.Time // service start time stamp
-	DataStat   LinkPktStats
-	IkeStat    LinkPktStats
-	NatTStat   LinkPktStats
-	EspStat    LinkPktStats
-	ErrStat    LinkPktStats
-	PhyErrStat LinkPktStats
-	VpnConns   []*VpnConnMetrics
-}
-
 // IPTuple :
 type IPTuple struct {
 	Src     net.IP // local App IP address
@@ -3031,11 +2867,22 @@ type IPTuple struct {
 
 // FlowScope :
 type FlowScope struct {
-	UUID      uuid.UUID
-	Intf      string
-	Localintf string
-	NetUUID   uuid.UUID
-	Sequence  string // used internally for limit and pkt size per app/bn
+	AppUUID        uuid.UUID
+	NetAdapterName string // logical name for VIF (set by controller in NetworkAdapter.Name)
+	BrIfName       string
+	NetUUID        uuid.UUID
+	Sequence       string // used internally for limit and pkt size per app/bn
+}
+
+// Key identifies flow.
+func (fs FlowScope) Key() string {
+	// Use adapter name instead of NI UUID because application can be connected to the same
+	// network instance with multiple interfaces.
+	key := fs.AppUUID.String() + "-" + fs.NetAdapterName
+	if fs.Sequence != "" {
+		key += "-" + fs.Sequence
+	}
+	return key
 }
 
 // ACLActionType - action
@@ -3079,7 +2926,7 @@ type IPFlow struct {
 
 // Key :
 func (flows IPFlow) Key() string {
-	return flows.Scope.UUID.String() + flows.Scope.NetUUID.String() + flows.Scope.Sequence
+	return flows.Scope.Key()
 }
 
 // LogCreate : we treat IPFlow as Metrics for logging
@@ -3118,56 +2965,6 @@ func (flows IPFlow) LogDelete(logBase *base.LogObject) {
 // LogKey :
 func (flows IPFlow) LogKey() string {
 	return string(base.IPFlowLogType) + "-" + flows.Key()
-}
-
-// VifIPTrig - structure contains Mac Address
-type VifIPTrig struct {
-	MacAddr   string
-	IPv4Addr  net.IP
-	IPv6Addrs []net.IP
-}
-
-// Key - VifIPTrig key function
-func (vifIP VifIPTrig) Key() string {
-	return vifIP.MacAddr
-}
-
-// LogCreate :
-func (vifIP VifIPTrig) LogCreate(logBase *base.LogObject) {
-	logObject := base.NewLogObject(logBase, base.VifIPTrigLogType, "",
-		nilUUID, vifIP.LogKey())
-	if logObject == nil {
-		return
-	}
-	logObject.Noticef("Vif IP trig create")
-}
-
-// LogModify :
-func (vifIP VifIPTrig) LogModify(logBase *base.LogObject, old interface{}) {
-	logObject := base.EnsureLogObject(logBase, base.VifIPTrigLogType, "",
-		nilUUID, vifIP.LogKey())
-
-	oldVifIP, ok := old.(VifIPTrig)
-	if !ok {
-		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of VifIPTrig type")
-	}
-	// XXX remove?
-	logObject.CloneAndAddField("diff", cmp.Diff(oldVifIP, vifIP)).
-		Noticef("Vif IP trig modify")
-}
-
-// LogDelete :
-func (vifIP VifIPTrig) LogDelete(logBase *base.LogObject) {
-	logObject := base.EnsureLogObject(logBase, base.VifIPTrigLogType, "",
-		nilUUID, vifIP.LogKey())
-	logObject.Noticef("Vif IP trig delete")
-
-	base.DeleteLogObject(logBase, vifIP.LogKey())
-}
-
-// LogKey :
-func (vifIP VifIPTrig) LogKey() string {
-	return string(base.VifIPTrigLogType) + "-" + vifIP.Key()
 }
 
 // OnboardingStatus - UUID, etc. advertised by client process

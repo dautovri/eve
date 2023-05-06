@@ -1,4 +1,4 @@
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 as build
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb as build
 ENV BUILD_PKGS gcc make file patch libc-dev util-linux-dev linux-headers openssl-dev g++ tar
 RUN eve-alpine-deploy.sh
 
@@ -20,7 +20,7 @@ RUN tar xvzf popt-${POPT_VERSION}.tar.gz
 WORKDIR /popt/popt-${POPT_VERSION}
 COPY patches/popt* /popt
 RUN for patch in /popt/*patch ; do patch -p1 < $patch ; done
-RUN ./configure && make && make install
+RUN ./configure && make -j "$(getconf _NPROCESSORS_ONLN)" && make install
 
 
 WORKDIR /

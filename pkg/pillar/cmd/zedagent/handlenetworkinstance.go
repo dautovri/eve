@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/golang/protobuf/ptypes/timestamp"
@@ -44,7 +43,7 @@ func handleNetworkInstanceImpl(ctxArg interface{}, key string,
 		log.Errorf("Received NetworkInstance error %s",
 			status.Error)
 	}
-	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, false)
+	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, false, AllDest)
 	log.Functionf("handleNetworkInstanceImpl(%s) done", key)
 }
 
@@ -54,7 +53,7 @@ func handleNetworkInstanceDelete(ctxArg interface{}, key string,
 	log.Functionf("handleNetworkInstanceDelete(%s)", key)
 	status := statusArg.(types.NetworkInstanceStatus)
 	ctx := ctxArg.(*zedagentContext)
-	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, true)
+	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, true, AllDest)
 	log.Functionf("handleNetworkInstanceDelete(%s) done", key)
 }
 
@@ -66,7 +65,7 @@ func handleNetworkInstanceDelete(ctxArg interface{}, key string,
 // (indicating deletion) would make is explicit
 // and easy for the cloud process.
 func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
-	status types.NetworkInstanceStatus, deleted bool) {
+	status types.NetworkInstanceStatus, deleted bool, dest destinationBitset) {
 
 	infoMsg := &zinfo.ZInfoMsg{}
 	infoType := new(zinfo.ZInfoTypes)
@@ -82,7 +81,7 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	if !deleted {
 		info.Displayname = status.DisplayName
 		info.InstType = uint32(status.Type)
-		info.CurrentUplinkIntf = status.CurrentUplinkIntf
+		info.CurrentUplinkIntf = status.SelectedUplinkIntf
 
 		if !status.ErrorTime.IsZero() {
 			errInfo := new(zinfo.ErrorInfo)
@@ -100,7 +99,9 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 
 		info.BridgeNum = uint32(status.BridgeNum)
 		info.BridgeName = status.BridgeName
-		info.BridgeIPAddr = status.BridgeIPAddr
+		if len(status.BridgeIPAddr) > 0 {
+			info.BridgeIPAddr = status.BridgeIPAddr.String()
+		}
 
 		for mac, addrs := range status.IPAssignments {
 			assignment := new(zinfo.ZmetIPAssignmentEntry)
@@ -152,11 +153,6 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 			info.AssignedAdapters = append(info.AssignedAdapters,
 				reportAA)
 		}
-
-		// fill Vpn info
-		if status.VpnStatus != nil {
-			fillVpnInfo(info, status.VpnStatus)
-		}
 	}
 
 	infoMsg.InfoContent = new(zinfo.ZInfoMsg_Niinfo)
@@ -170,7 +166,7 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	if err != nil {
 		log.Fatal("Publish NetworkInstance proto marshaling error: ", err)
 	}
-	statusURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
+
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
 		log.Fatal("malloc error")
@@ -180,60 +176,8 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	//We queue the message and then get the highest priority message to send.
 	//If there are no failures and defers we'll send this message,
 	//but if there is a queue we'll retry sending the highest priority message.
-	zedcloud.SetDeferred(zedcloudCtx, uuid, buf, size, statusURL,
-		true, false, zinfo.ZInfoTypes_ZiNetworkInstance)
-	zedcloud.HandleDeferred(zedcloudCtx, time.Now(), 0, true)
-}
-
-func fillVpnInfo(info *zinfo.ZInfoNetworkInstance, vpnStatus *types.VpnStatus) {
-
-	info.SoftwareList = new(zinfo.ZInfoSW)
-	info.SoftwareList.SwVersion = vpnStatus.Version
-	upTime, _ := ptypes.TimestampProto(vpnStatus.UpTime)
-	info.UpTimeStamp = upTime
-
-	vpnInfo := new(zinfo.ZInfoVpn)
-	vpnInfo.PolicyBased = vpnStatus.PolicyBased
-	listeningIpAddrs := strings.Split(vpnStatus.IpAddrs, " ")
-	vpnInfo.ListeningIpAddrs = make([]string, len(listeningIpAddrs))
-	for idx, ipAddr := range listeningIpAddrs {
-		vpnInfo.ListeningIpAddrs[idx] = ipAddr
-	}
-
-	totalConnCount := len(vpnStatus.StaleVpnConns) + len(vpnStatus.ActiveVpnConns)
-
-	if totalConnCount == 0 {
-		info.InfoContent = new(zinfo.ZInfoNetworkInstance_Vinfo)
-		if x, ok := info.GetInfoContent().(*zinfo.ZInfoNetworkInstance_Vinfo); ok {
-			x.Vinfo = vpnInfo
-		}
-		return
-	}
-
-	vpnInfo.Conn = make([]*zinfo.ZInfoVpnConn, totalConnCount)
-	// stale connections
-	connIdx := 0
-	for _, vpnConn := range vpnStatus.StaleVpnConns {
-		vpnConnInfo := publishVpnConnection(vpnInfo, vpnConn)
-		if vpnConnInfo != nil {
-			vpnInfo.Conn[connIdx] = vpnConnInfo
-			connIdx++
-		}
-	}
-
-	// active connections
-	for _, vpnConn := range vpnStatus.ActiveVpnConns {
-		vpnConnInfo := publishVpnConnection(vpnInfo, vpnConn)
-		if vpnConnInfo != nil {
-			vpnInfo.Conn[connIdx] = vpnConnInfo
-			connIdx++
-		}
-	}
-
-	info.InfoContent = new(zinfo.ZInfoNetworkInstance_Vinfo)
-	if x, ok := info.GetInfoContent().(*zinfo.ZInfoNetworkInstance_Vinfo); ok {
-		x.Vinfo = vpnInfo
-	}
+	queueInfoToDest(ctx, dest, uuid, buf, size, true, false, false,
+		zinfo.ZInfoTypes_ZiNetworkInstance)
 }
 
 func protoEncodeGenericInstanceMetric(status types.NetworkInstanceMetrics,
@@ -267,158 +211,6 @@ func protoEncodeGenericInstanceMetric(status types.NetworkInstanceMetrics,
 	metric.NetworkStats = networkStats
 }
 
-func protoEncodeVpnInstanceMetric(metrics types.NetworkInstanceMetrics,
-	instanceMetrics *zmet.ZMetricNetworkInstance) {
-
-	if metrics.VpnMetrics == nil {
-		return
-	}
-	protoEncodeGenericInstanceMetric(metrics, instanceMetrics)
-
-	stats := metrics.VpnMetrics
-	vpnMetric := new(zmet.ZMetricVpn)
-	vpnMetric.ConnStat = protoEncodeVpnInstanceStat(stats.DataStat)
-	vpnMetric.NatTStat = protoEncodeVpnInstanceStat(stats.NatTStat)
-	vpnMetric.IkeStat = protoEncodeVpnInstanceStat(stats.IkeStat)
-	vpnMetric.EspStat = protoEncodeVpnInstanceStat(stats.EspStat)
-
-	instanceMetrics.InstanceContent = new(zmet.ZMetricNetworkInstance_Vpnm)
-	if x, ok := instanceMetrics.GetInstanceContent().(*zmet.ZMetricNetworkInstance_Vpnm); ok {
-		x.Vpnm = vpnMetric
-	}
-	protoEncodeVpnInstanceFlowMetric(metrics, instanceMetrics)
-}
-
-func protoEncodeVpnInstanceStat(stats types.LinkPktStats) *zmet.ZMetricConn {
-	connStat := new(zmet.ZMetricConn)
-	connStat.InPkts = new(zmet.PktStat)
-	connStat.OutPkts = new(zmet.PktStat)
-	connStat.InPkts.Packets = stats.InPkts.Pkts
-	connStat.InPkts.Bytes = stats.InPkts.Bytes
-	connStat.OutPkts.Packets = stats.OutPkts.Pkts
-	connStat.OutPkts.Bytes = stats.OutPkts.Bytes
-	return connStat
-}
-
-func protoEncodeVpnInstanceFlowMetric(metrics types.NetworkInstanceMetrics,
-	instanceMetrics *zmet.ZMetricNetworkInstance) {
-
-	if len(metrics.VpnMetrics.VpnConns) == 0 {
-		return
-	}
-
-	vpnMetrics := metrics.VpnMetrics
-	instanceMetrics.FlowStats = make([]*zmet.ZMetricFlow,
-		len(vpnMetrics.VpnConns))
-	for idx, connStats := range vpnMetrics.VpnConns {
-
-		flowStats := new(zmet.ZMetricFlow)
-		flowStats.Id = connStats.Id
-		flowStats.Name = connStats.Name
-		flowStats.Type = uint32(connStats.Type)
-		flowStats.EstTime = connStats.EstTime
-
-		lEndPoint := protoEncodeVpnMetricEndPtIpAddr(connStats.LEndPoint)
-		lEndPoint.Stats = protoEncodeVpnMetricStats(connStats.LEndPoint.PktStats)
-		lLink := protoEncodeVpnMetricLink(connStats.LEndPoint.LinkInfo)
-		lEndPoint.Link = make([]*zmet.ZMetricFlowLink, 1)
-		lEndPoint.Link[0] = lLink
-
-		rEndPoint := protoEncodeVpnMetricEndPtIpAddr(connStats.REndPoint)
-		rEndPoint.Stats = protoEncodeVpnMetricStats(connStats.REndPoint.PktStats)
-		rLink := protoEncodeVpnMetricLink(connStats.REndPoint.LinkInfo)
-		rEndPoint.Link = make([]*zmet.ZMetricFlowLink, 1)
-		rEndPoint.Link[0] = rLink
-
-		flowStats.LEndPoint = lEndPoint
-		flowStats.REndPoint = make([]*zmet.ZMetricFlowEndPoint, 1)
-		flowStats.REndPoint[0] = rEndPoint
-		instanceMetrics.FlowStats[idx] = flowStats
-	}
-}
-
-func protoEncodeVpnMetricEndPtIpAddr(endPInfo types.VpnEndPointMetrics) *zmet.ZMetricFlowEndPoint {
-	endPoint := new(zmet.ZMetricFlowEndPoint)
-	endPoint.Endpoint = new(zmet.ZMetricFlowEndPoint_IpAddr)
-	if x, ok := endPoint.GetEndpoint().(*zmet.ZMetricFlowEndPoint_IpAddr); ok {
-		x.IpAddr = endPInfo.IpAddr
-	}
-	return endPoint
-}
-
-func protoEncodeVpnMetricLink(linkInfo types.VpnLinkMetrics) *zmet.ZMetricFlowLink {
-	link := new(zmet.ZMetricFlowLink)
-	link.SpiId = linkInfo.SpiId
-	link.Link = new(zmet.ZMetricFlowLink_SubNet)
-	if x, ok := link.GetLink().(*zmet.ZMetricFlowLink_SubNet); ok {
-		x.SubNet = linkInfo.SubNet
-	}
-	return link
-}
-
-func protoEncodeVpnMetricStats(linkStats types.PktStats) *zmet.PktStat {
-	pktStats := new(zmet.PktStat)
-	pktStats.Bytes = linkStats.Bytes
-	pktStats.Packets = linkStats.Pkts
-	return pktStats
-}
-
-func publishVpnConnection(vpnInfo *zinfo.ZInfoVpn,
-	vpnConn *types.VpnConnStatus) *zinfo.ZInfoVpnConn {
-	if vpnConn == nil {
-		return nil
-	}
-	vpnConnInfo := new(zinfo.ZInfoVpnConn)
-	vpnConnInfo.Id = vpnConn.Id
-	vpnConnInfo.Name = vpnConn.Name
-	vpnConnInfo.State = zinfo.ZInfoVpnState(vpnConn.State)
-	vpnConnInfo.Ikes = vpnConn.Ikes
-	vpnConnInfo.EstTime = vpnConn.EstTime
-	vpnConnInfo.Version = vpnConn.Version
-
-	lEndPointInfo := new(zinfo.ZInfoVpnEndPoint)
-	lEndPointInfo.Id = vpnConn.LInfo.Id
-	lEndPointInfo.IpAddr = vpnConn.LInfo.IpAddr
-	lEndPointInfo.Port = vpnConn.LInfo.Port
-	vpnConnInfo.LInfo = lEndPointInfo
-
-	rEndPointInfo := new(zinfo.ZInfoVpnEndPoint)
-	rEndPointInfo.Id = vpnConn.RInfo.Id
-	rEndPointInfo.IpAddr = vpnConn.RInfo.IpAddr
-	rEndPointInfo.Port = vpnConn.RInfo.Port
-	vpnConnInfo.RInfo = rEndPointInfo
-
-	if len(vpnConn.Links) == 0 {
-		return vpnConnInfo
-	}
-	vpnConnInfo.Links = make([]*zinfo.ZInfoVpnLink, len(vpnConn.Links))
-
-	for idx, linkData := range vpnConn.Links {
-		linkInfo := new(zinfo.ZInfoVpnLink)
-		linkInfo.Id = linkData.Id
-		linkInfo.ReqId = linkData.ReqId
-		linkInfo.InstTime = linkData.InstTime
-		linkInfo.EspInfo = linkData.EspInfo
-		linkInfo.State = zinfo.ZInfoVpnState(linkData.State)
-
-		linfo := new(zinfo.ZInfoVpnLinkInfo)
-		linfo.SubNet = linkData.LInfo.SubNet
-		linfo.SpiId = linkData.LInfo.SpiId
-		linfo.Direction = linkData.LInfo.Direction
-		linkInfo.LInfo = linfo
-
-		rinfo := new(zinfo.ZInfoVpnLinkInfo)
-		rinfo.SubNet = linkData.RInfo.SubNet
-		rinfo.SpiId = linkData.RInfo.SpiId
-		rinfo.Direction = linkData.RInfo.Direction
-		linkInfo.RInfo = rinfo
-
-		vpnConnInfo.Links[idx] = linkInfo
-	}
-
-	return vpnConnInfo
-}
-
 func handleAppFlowMonitorCreate(ctxArg interface{}, key string,
 	statusArg interface{}) {
 	handleAppFlowMonitorImpl(ctxArg, key, statusArg)
@@ -441,7 +233,7 @@ func handleAppFlowMonitorImpl(ctxArg interface{}, key string,
 
 	// publish protobuf-encoded flowlog to zedcloud
 	select {
-	case ctx.FlowlogQueue <- pflows:
+	case ctx.flowlogQueue <- pflows:
 	default:
 		log.Errorf("Flowlog queue is full, dropping flowlog entry: %+v", pflows.Scope)
 		ctx.flowLogMetrics.Lock()
@@ -476,9 +268,9 @@ func protoEncodeAppFlowMonitorProto(ipflow types.IPFlow) *flowlog.FlowMessage {
 
 	// ScopeInfo fill in
 	pScope := new(flowlog.ScopeInfo)
-	pScope.Uuid = ipflow.Scope.UUID.String()
-	pScope.Intf = ipflow.Scope.Intf
-	pScope.LocalIntf = ipflow.Scope.Localintf
+	pScope.Uuid = ipflow.Scope.AppUUID.String()
+	pScope.Intf = ipflow.Scope.NetAdapterName
+	pScope.LocalIntf = ipflow.Scope.BrIfName
 	pScope.NetInstUUID = ipflow.Scope.NetUUID.String()
 	pflows.Scope = pScope
 

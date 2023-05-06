@@ -1,4 +1,4 @@
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 as kernel-build
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb as kernel-build
 
 ENV BUILD_PKGS \
     argp-standalone automake bash bc binutils-dev bison build-base \
@@ -31,7 +31,7 @@ RUN rm -rf /out && mkdir /out
 RUN if [ "$(uname -m)" = "x86_64" ] ; then \
     cp kernel_config_uefi_sos .config && \
     make olddefconfig && \
-    make -j4 && \
+    make -j "$(getconf _NPROCESSORS_ONLN)" && \
     cp arch/x86_64/boot/bzImage /out/kernel && \
     cp System.map /out ;\
 fi

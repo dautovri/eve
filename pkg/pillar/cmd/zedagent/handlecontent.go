@@ -18,8 +18,9 @@ import (
 var contentInfoHash []byte
 
 // stringsToUuids() - converts list of strings to a list of uuids,
-//                    returns a list with a nil uuid and a last error if
-//                    conversion fails
+//
+//	returns a list with a nil uuid and a last error if
+//	conversion fails
 func stringsToUuids(strings []string) ([]uuid.UUID, error) {
 	list := make([]uuid.UUID, len(strings))
 	for i, str := range strings {
@@ -140,7 +141,7 @@ func handleContentTreeStatusImpl(ctxArg interface{}, key string,
 	status := statusArg.(types.ContentTreeStatus)
 	ctx := ctxArg.(*zedagentContext)
 	uuidStr := status.Key()
-	PublishContentInfoToZedCloud(ctx, uuidStr, &status, ctx.iteration)
+	PublishContentInfoToZedCloud(ctx, uuidStr, &status, ctx.iteration, AllDest)
 	ctx.iteration++
 }
 
@@ -149,6 +150,6 @@ func handleContentTreeStatusDelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedagentContext)
 	uuidStr := key
-	PublishContentInfoToZedCloud(ctx, uuidStr, nil, ctx.iteration)
+	PublishContentInfoToZedCloud(ctx, uuidStr, nil, ctx.iteration, AllDest)
 	ctx.iteration++
 }

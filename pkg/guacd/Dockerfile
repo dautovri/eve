@@ -1,4 +1,4 @@
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 as build
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb as build
 ENV BUILD_PKGS cairo-dev jpeg-dev libpng-dev gcc make libc-dev openssl-dev libvncserver-dev file patch
 ENV PKGS alpine-baselayout musl-utils libtasn1-progs p11-kit cairo jpeg libpng libvncserver
 RUN eve-alpine-deploy.sh
@@ -9,7 +9,7 @@ ADD http://apache.org/dyn/closer.cgi?action=download&filename=guacamole/${GUACD_
 ADD uuid-1.6.2.tar.gz /
 COPY patches /patches
 
-RUN cd /uuid-1.6.2 ; ./configure --prefix=/usr/ && make && make install
+RUN cd /uuid-1.6.2 ; ./configure --prefix=/usr/ && make -j "$(getconf _NPROCESSORS_ONLN)" && make install
 
 RUN tar xzvf ${GUACD_VERSION}.tar.gz ;\
     cd /guacamole-server-${GUACD_VERSION} ;\
@@ -18,7 +18,7 @@ RUN tar xzvf ${GUACD_VERSION}.tar.gz ;\
             patch -p1 < "$patch"; \
         done;\
     ./configure --prefix=/usr/ --with-vnc --disable-guacenc --disable-dependency-tracking && \
-     make && make install
+     make -j "$(getconf _NPROCESSORS_ONLN)" && make install
 
 FROM scratch
 

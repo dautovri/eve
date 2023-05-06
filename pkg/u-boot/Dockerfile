@@ -1,4 +1,4 @@
-FROM lfedge/eve-alpine:145f062a40639b6c65efa36bed1c5614b873be52 as build-base
+FROM lfedge/eve-alpine:9fb9b9cbf7d90066a70e4704d04a6fe248ff52bb as build-base
 ENV BUILD_PKGS bash binutils-dev build-base bc bison flex openssl-dev python3 swig dtc
 ENV BUILD_PKGS_amd64 python3-dev py-pip
 RUN eve-alpine-deploy.sh
@@ -53,9 +53,7 @@ FROM build-${TARGETARCH} AS build
 COPY config /tmp/
 RUN cat /tmp/config >> "configs/${TARGET}"
 # generate default config for the target
-# hadolint ignore=DL3059,SC2086
-RUN make $TARGET
-# hadolint ignore=DL3059
+RUN make "$TARGET"
 RUN make -j "$(getconf _NPROCESSORS_ONLN)"
 
 # export a final set of u-boot artifacts into /boot

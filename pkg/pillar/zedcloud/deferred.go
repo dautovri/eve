@@ -17,15 +17,14 @@ import (
 )
 
 // Example usage:
-// deferredChan := zedcloud.InitDeferred(zedcloudCtx)
+// ctx := zedcloud.CreateDeferredCtx(zedcloudCtx, ...)
 // select {
-//      case change := <- deferredChan:
-//		zedcloud.HandleDeferred(zedcloudCtx, change)
+//      case change := <- ctx.Ticker.C:
+//          ctx.HandleDeferred(...)
 // Before or after sending success call:
-//	zedcloud.RemoveDeferred(key)
+//     ctx.RemoveDeferred(key)
 // After failure call
-// 	zedcloud.SetDeferred(key, buf, size, url, zedcloudCtx)
-// or AddDeferred to build a queue for each key
+//     ctx.SetDeferred(key, buf, size, ...)
 
 type deferredItem struct {
 	itemType       interface{}
@@ -35,6 +34,7 @@ type deferredItem struct {
 	url            string
 	bailOnHTTPErr  bool // Return 4xx and 5xx without trying other interfaces
 	withNetTracing bool
+	ignoreErr      bool
 }
 
 const maxTimeToHandleDeferred = time.Minute
@@ -44,7 +44,7 @@ const longTime2 = time.Hour * 48
 // DeferredContext is part of ZedcloudContext
 type DeferredContext struct {
 	deferredItems          []*deferredItem
-	ticker                 flextimer.FlexTickerHandle
+	Ticker                 flextimer.FlexTickerHandle
 	priorityCheckFunctions []TypePriorityCheckFunction
 	lock                   *sync.Mutex
 	sentHandler            *SentHandlerFunction
@@ -61,54 +61,56 @@ type SentHandlerFunction func(
 	itemType interface{}, data *bytes.Buffer, result types.SenderStatus,
 	traces []netdump.TracedNetRequest)
 
-// GetDeferredChan creates and returns a channel to the caller
+// CreateDeferredCtx creates and returns a deferred context
 // We always keep a flextimer running so that we can return
 // the associated channel. We adjust the times when we start and stop
 // the timer.
 // sentHandler is callback which will be run on successful sent
 // priorityCheckFunctions may be added to send item with matched itemType firstly
 // default function at the end of priorityCheckFunctions added to serve non-priority items
-func GetDeferredChan(zedcloudCtx *ZedCloudContext, sentHandler *SentHandlerFunction, priorityCheckFunctions ...TypePriorityCheckFunction) <-chan time.Time {
-	//append with return first
-	priorityCheckFunctions = append(priorityCheckFunctions, func(obj interface{}) bool {
-		return true
-	})
-	zedcloudCtx.deferredCtx = DeferredContext{
+func CreateDeferredCtx(zedcloudCtx *ZedCloudContext, sentHandler *SentHandlerFunction,
+	priorityCheckFunctions ...TypePriorityCheckFunction) *DeferredContext {
+	// Default "accept all" priority
+	priorityCheckFunctions = append(priorityCheckFunctions,
+		func(obj interface{}) bool {
+			return true
+		})
+
+	deferredCtx := DeferredContext{
 		lock:                   &sync.Mutex{},
-		ticker:                 flextimer.NewRangeTicker(longTime1, longTime2),
+		Ticker:                 flextimer.NewRangeTicker(longTime1, longTime2),
 		sentHandler:            sentHandler,
 		priorityCheckFunctions: priorityCheckFunctions,
 		zedcloudCtx:            zedcloudCtx,
 	}
-	return zedcloudCtx.deferredCtx.ticker.C
+
+	return &deferredCtx
 }
 
 // HandleDeferred try to send all deferred items (or only one if sendOne set). Give up if any one fails
 // Stop timer if map becomes empty
 // Returns true when there are no more deferred items
-func HandleDeferred(zedcloudCtx *ZedCloudContext, event time.Time, spacing time.Duration, sendOne bool) bool {
-
-	return zedcloudCtx.deferredCtx.handleDeferred(zedcloudCtx.log, event, spacing, sendOne)
-}
-
-func (ctx *DeferredContext) handleDeferred(log *base.LogObject, event time.Time,
+func (ctx *DeferredContext) HandleDeferred(event time.Time,
 	spacing time.Duration, sendOne bool) bool {
 	ctx.lock.Lock()
-	defer ctx.lock.Unlock()
+	reqs := ctx.deferredItems
+	ctx.deferredItems = []*deferredItem{}
+	ctx.lock.Unlock()
 
-	if len(ctx.deferredItems) == 0 {
+	log := ctx.zedcloudCtx.log
+
+	if len(reqs) == 0 {
 		return true
 	}
 
-	log.Functionf("HandleDeferred(%v, %v) items %d",
-		event, spacing, len(ctx.deferredItems))
+	log.Functionf("HandleDeferred(%v, %v) items %d", event, spacing, len(reqs))
 
 	exit := false
 	sent := 0
 	ctxWork, cancel := GetContextForAllIntfFunctions(ctx.zedcloudCtx)
 	defer cancel()
 	for _, f := range ctx.priorityCheckFunctions {
-		for _, item := range ctx.deferredItems {
+		for _, item := range reqs {
 			key := item.key
 			//check with current priority function
 			if !f(item.itemType) {
@@ -137,7 +139,7 @@ func (ctx *DeferredContext) handleDeferred(log *base.LogObject, event time.Time,
 			} else if err != nil {
 				log.Functionf("handleDeferred: for %s status %d failed %s",
 					key, rv.Status, err)
-				exit = true
+				exit = !item.ignoreErr
 				// Make sure we pass a non-zero result to the sentHandler.
 				if rv.Status == types.SenderStatusNone {
 					rv.Status = types.SenderStatusFailed
@@ -145,7 +147,7 @@ func (ctx *DeferredContext) handleDeferred(log *base.LogObject, event time.Time,
 			} else if rv.Status != types.SenderStatusNone {
 				log.Functionf("handleDeferred: for %s received unexpected status %d",
 					key, rv.Status)
-				exit = true
+				exit = !item.ignoreErr
 			}
 			if ctx.sentHandler != nil {
 				f := *ctx.sentHandler
@@ -174,7 +176,7 @@ func (ctx *DeferredContext) handleDeferred(log *base.LogObject, event time.Time,
 			}
 
 			// XXX sleeping in main thread
-			if len(ctx.deferredItems)-sent != 0 && spacing != 0 {
+			if len(reqs)-sent != 0 && spacing != 0 {
 				log.Functionf("handleDeferred: sleeping %v",
 					spacing)
 				time.Sleep(spacing)
@@ -185,55 +187,56 @@ func (ctx *DeferredContext) handleDeferred(log *base.LogObject, event time.Time,
 		}
 	}
 
-	if sent > 0 {
-		//do cleanup
-		var newDeferredItems []*deferredItem
-		for _, el := range ctx.deferredItems {
+	var notSentReqs []*deferredItem
+	if sent == 0 {
+		// Take the whole queue
+		notSentReqs = reqs
+	} else {
+		// Keep not sent requests
+		for _, el := range reqs {
 			if el.buf != nil {
-				newDeferredItems = append(newDeferredItems, el)
+				notSentReqs = append(notSentReqs, el)
 			}
 		}
-		ctx.deferredItems = newDeferredItems
 	}
 
-	if len(ctx.deferredItems) == 0 {
-		stopTimer(log, ctx)
-	}
-	if len(ctx.deferredItems) == 0 {
-		log.Functionf("handleDeferred() done")
-		return true
-	}
-	log.Noticef("handleDeferred() done items %d", len(ctx.deferredItems))
-	// Log the content of the queue
+	// Log the content of the rest in the queue
+	log.Noticef("handleDeferred() the rest to be sent: %d",
+		len(notSentReqs))
 	if ctx.sentHandler != nil {
-		for _, item := range ctx.deferredItems {
+		for _, item := range notSentReqs {
 			f := *ctx.sentHandler
 			f(item.itemType, item.buf, types.SenderStatusDebug, nil)
 		}
 	}
-	return false
+
+	ctx.lock.Lock()
+	// Merge with the incoming requests, recently added are in the tail
+	ctx.deferredItems = append(notSentReqs, ctx.deferredItems...)
+	if len(ctx.deferredItems) == 0 {
+		stopTimer(log, ctx)
+	}
+	ctx.lock.Unlock()
+
+	allSent := len(notSentReqs) == 0
+
+	return allSent
 }
 
-// Replace any item for the specified key. If timer not running start it
-// SetDeferred uses the key for identifying the channel. Please note that
-// for deviceUUID key is used for attestUrl, which is not the same for
-// other Urls, where in other caes, the key is very specific for the object
-//
-//	and object type
-func SetDeferred(zedcloudCtx *ZedCloudContext, key string, buf *bytes.Buffer,
-	size int64, url string, bailOnHTTPErr, withNetTracing bool, itemType interface{}) {
-
-	zedcloudCtx.deferredCtx.setDeferred(zedcloudCtx, key, buf, size, url, bailOnHTTPErr,
-		withNetTracing, itemType)
-}
-
-func (ctx *DeferredContext) setDeferred(zedcloudCtx *ZedCloudContext,
+// SetDeferred sets or replaces any item for the specified key and
+// starts the timer. Key is used for identifying the channel. Please
+// note that for deviceUUID key is used for attestUrl, which is not the
+// same for other Urls, where in other case, the key is very specific
+// for the object. If @ignoreErr is true the queue processing is not
+// stopped on any error and will continue, although all errors will be
+// passed to @sentHandler callback (see the CreateDeferredCtx()).
+func (ctx *DeferredContext) SetDeferred(
 	key string, buf *bytes.Buffer, size int64, url string, bailOnHTTPErr,
-	withNetTracing bool, itemType interface{}) {
+	withNetTracing, ignoreErr bool, itemType interface{}) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
 
-	log := zedcloudCtx.log
+	log := ctx.zedcloudCtx.log
 	log.Functionf("SetDeferred(%s) size %d items %d",
 		key, size, len(ctx.deferredItems))
 	if len(ctx.deferredItems) == 0 {
@@ -247,6 +250,7 @@ func (ctx *DeferredContext) setDeferred(zedcloudCtx *ZedCloudContext,
 		url:            url,
 		bailOnHTTPErr:  bailOnHTTPErr,
 		withNetTracing: withNetTracing,
+		ignoreErr:      ignoreErr,
 	}
 	found := false
 	ind := 0
@@ -267,15 +271,11 @@ func (ctx *DeferredContext) setDeferred(zedcloudCtx *ZedCloudContext,
 }
 
 // RemoveDeferred removes key from deferred items if exists
-func RemoveDeferred(zedcloudCtx *ZedCloudContext, key string) {
-	zedcloudCtx.deferredCtx.removeDeferred(zedcloudCtx, key)
-}
-
-func (ctx *DeferredContext) removeDeferred(zedcloudCtx *ZedCloudContext, key string) {
+func (ctx *DeferredContext) RemoveDeferred(key string) {
 	ctx.lock.Lock()
 	defer ctx.lock.Unlock()
 
-	log := zedcloudCtx.log
+	log := ctx.zedcloudCtx.log
 	log.Functionf("RemoveDeferred(%s) items %d",
 		key, len(ctx.deferredItems))
 
@@ -291,17 +291,22 @@ func (ctx *DeferredContext) removeDeferred(zedcloudCtx *ZedCloudContext, key str
 	}
 }
 
+// KickTimer kicks the timer for immediate execution
+func (ctx *DeferredContext) KickTimer() {
+	ctx.Ticker.TickNow()
+}
+
 // Try every minute backoff to every 15 minutes
 func startTimer(log *base.LogObject, ctx *DeferredContext) {
 
 	log.Functionf("startTimer()")
 	min := 1 * time.Minute
 	max := 15 * time.Minute
-	ctx.ticker.UpdateExpTicker(min, max, 0.3)
+	ctx.Ticker.UpdateExpTicker(min, max, 0.3)
 }
 
 func stopTimer(log *base.LogObject, ctx *DeferredContext) {
 
 	log.Functionf("stopTimer()")
-	ctx.ticker.UpdateRangeTicker(longTime1, longTime2)
+	ctx.Ticker.UpdateRangeTicker(longTime1, longTime2)
 }
