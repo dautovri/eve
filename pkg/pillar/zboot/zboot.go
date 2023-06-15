@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -248,6 +249,31 @@ func GetPartitionDevname(partName string) string {
 	devName = strings.TrimSpace(devName)
 	partDev[partName] = devName
 	return devName
+}
+
+// GetPartitionSizeInBytes get the partition size for partition partName
+func GetPartitionSizeInBytes(partName string) uint64 {
+	validatePartitionName(partName)
+	_, ok := partDev[partName]
+	if ok {
+		ret, err := execWithRetry(nil, "zboot", "partdevsize", partName)
+		if err != nil {
+			logrus.Fatalf("zboot partdevsize %s: err %v\n", partName, err)
+		}
+		partsize := string(ret)
+		partsize = strings.TrimSpace(partsize)
+		logrus.Infof("partsize in bytes %s", partsize)
+		value, err := strconv.ParseUint(partsize, 10, 64)
+		if err != nil {
+			logrus.Errorf("Strconv failed for partsize err %v\n", err)
+			return 0
+		}
+
+		return value
+	}
+
+	// Invalid partition
+	return 0
 }
 
 // set routines

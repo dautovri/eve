@@ -440,6 +440,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 	}
 
 	// We report all the ports in DeviceNetworkStatus
+	// TODO: report also modems not used by any port.
 	labelList := types.ReportLogicallabels(*deviceNetworkStatus)
 	for _, label := range labelList {
 		ports := deviceNetworkStatus.GetPortsByLogicallabel(label)
@@ -613,7 +614,11 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 
 	ReportDeviceInfo.State = getState(ctx)
 
-	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_START_DELAY_IN_SECONDS
+	// TODO: Enhance capability reporting with a bitmap-like approach for increased granularity.
+	// We report the snapshot capability despite the fact that we support snapshots only
+	// for file-based volumes. If a controller tries to make a snapshot of ZFS-based volume
+	// device returns a runtime error.
+	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_VOLUME_SNAPSHOTS
 
 	// Report if there is a local override of profile
 	if ctx.getconfigCtx.currentProfile != ctx.getconfigCtx.globalProfile {
@@ -947,6 +952,8 @@ func encodeSystemAdapterInfo(ctx *zedagentContext) *info.SystemAdapterInfo {
 				// info for ports from lower layers is not published
 				continue
 			}
+			// FIXME: publish status here, not config!
+			// TODO: include DNS servers, MTU, etc.
 			dps.Ports[j] = encodeNetworkPortConfig(ctx, &p)
 			if i == dpcl.CurrentIndex && p.WirelessCfg.WType == types.WirelessTypeCellular {
 				ports := deviceNetworkStatus.GetPortsByLogicallabel(p.Logicallabel)

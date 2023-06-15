@@ -132,6 +132,7 @@ func initOpts() {
 		"techsupport",
 		"top",
 		"volume",
+		"pprof",
 	}
 
 	logdirectory = []string{
@@ -419,11 +420,23 @@ func runCmd(prog string, args []string, isPrint bool) (string, error) {
 	} else {
 		retStr = string(retBytes)
 		if isPrint {
-			fmt.Println(retStr)
-			closePipe(true)
+			maySplitAndPrint([]byte(retStr))
 		}
 	}
 	return retStr, err
+}
+
+func maySplitAndPrint(pBytes []byte) {
+	if len(pBytes) > pipeBufHalfSize {
+		chunks := splitBySize(pBytes, pipeBufHalfSize)
+		for _, chunk := range chunks {
+			fmt.Println(string(chunk))
+			closePipe(true)
+		}
+	} else {
+		fmt.Println(string(pBytes))
+		closePipe(true)
+	}
 }
 
 func runCmdInFunction(prog string, args []string) ([]byte, error) {
@@ -663,6 +676,8 @@ func printHelp(opt string) {
 			helpExample("cat/<path> -line <num>", "display only <num> of lines, like 'head' if <num> is positive, like 'tail' if the <num> is negative", false)
 		case "datastore":
 			helpOn("datastore", "display the device current datastore: EQDN, type, cipher information")
+		case "pprof":
+			helpOn("pprof", "pprof/on to turn on pprof; pprof/off to turn off again")
 		case "dmesg":
 			helpOn("dmesg", "display the device current dmesg information")
 		case "download":

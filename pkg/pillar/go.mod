@@ -25,8 +25,8 @@ require (
 	github.com/jackwakefield/gopac v1.0.2
 	github.com/jaypipes/ghw v0.8.0
 	github.com/lf-edge/edge-containers v0.0.0-20221025050409-93c34bebadd2
-	github.com/lf-edge/eve/api/go v0.0.0-00010101000000-000000000000
-	github.com/lf-edge/eve/libs v0.0.0-20230303013136-e890ce9ee8a3
+	github.com/lf-edge/eve/api/go v0.0.0-20230602070228-0c11e32c7718
+	github.com/lf-edge/eve/libs v0.0.0-20230524115335-5c6c795151b7
 	github.com/linuxkit/linuxkit/src/cmd/linuxkit v0.0.0-20220913135124-e532e7310810
 	github.com/miekg/dns v1.1.41
 	github.com/moby/sys/mountinfo v0.6.0
@@ -73,7 +73,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/digitalocean/go-libvirt v0.0.0-20221020193630-0d0212f5ead2 // indirect
 	github.com/docker/cli v20.10.17+incompatible // indirect
-	github.com/docker/distribution v2.8.1+incompatible // indirect
+	github.com/docker/distribution v2.8.2+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.6.4 // indirect
 	github.com/docker/go-connections v0.4.1-0.20190612165340-fd1b1942c4d5 // indirect
 	github.com/docker/go-events v0.0.0-20190806004212-e31b211e4f1c // indirect
@@ -142,5 +142,3 @@ require (
 	howett.net/plist v0.0.0-20181124034731-591f970eefbb // indirect
 	oras.land/oras-go v1.2.0 // indirect
 )
-
-replace github.com/lf-edge/eve/api/go => ../../api/go

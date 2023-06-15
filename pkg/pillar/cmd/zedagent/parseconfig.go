@@ -406,7 +406,7 @@ func publishNetworkInstanceConfig(ctx *getconfigContext,
 			networkInstanceConfig.Type, networkInstanceConfig.Activate)
 
 		if apiConfigEntry.Port != nil {
-			networkInstanceConfig.Logicallabel = apiConfigEntry.Port.Name
+			networkInstanceConfig.PortLogicalLabel = apiConfigEntry.Port.Name
 		}
 		networkInstanceConfig.IpType = types.AddressType(apiConfigEntry.IpType)
 
@@ -527,6 +527,7 @@ func parseAppInstanceConfig(getconfigCtx *getconfigContext,
 		appInstance.FixedResources.BootLoader = cfgApp.Fixedresources.Bootloader
 		appInstance.FixedResources.Ramdisk = cfgApp.Fixedresources.Ramdisk
 		appInstance.FixedResources.MaxMem = int(cfgApp.Fixedresources.Maxmem)
+		appInstance.FixedResources.VMMMaxMem = int(cfgApp.Fixedresources.VmmMaxmem)
 		appInstance.FixedResources.Memory = int(cfgApp.Fixedresources.Memory)
 		appInstance.FixedResources.RootDev = cfgApp.Fixedresources.Rootdev
 		appInstance.FixedResources.VCpus = int(cfgApp.Fixedresources.Vcpus)

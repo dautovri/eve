@@ -30,7 +30,6 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/containerd"
 	"github.com/lf-edge/eve/pkg/pillar/cpuallocator"
-	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/hypervisor"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
@@ -43,7 +42,6 @@ import (
 	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -486,15 +484,13 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	// Before starting to process DomainConfig, domainmgr should (in this order):
 	//   1. wait for NIM to publish DNS to learn which ports are used for management
 	//   2. wait for PhysicalIOAdapters (from zedagent) to be processed
-	//   3. wait for NIM to finalize testing of selected DPC
-	//   4. wait for capabilities information from hypervisor
-	// Note: 2. and 3. can also execute in the reverse order.
-	// Note: 4 may come in any order
+	//   3. wait for capabilities information from hypervisor
+	// Note: 3 may come in any order
 	for !domainCtx.assignableAdapters.Initialized ||
 		len(domainCtx.deviceNetworkStatus.Ports) == 0 ||
-		domainCtx.deviceNetworkStatus.Testing ||
 		!capabilitiesSent {
-		log.Noticef("Waiting for AssignableAdapters and/or verified DPC")
+		log.Noticef("Waiting for AssignableAdapters, DPC with management ports " +
+			"and hypervisor capabilities")
 		select {
 		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
@@ -1598,11 +1594,6 @@ func doActivateTail(ctx *domainContext, status *types.DomainStatus,
 			status.Key())
 	}
 	status.Activated = true
-	err = setupVlans(status.VifList)
-	if err != nil {
-		log.Errorf("doActivateTail(%v) setupVlans failed for %s: %v",
-			status.UUIDandVersion, status.DisplayName, err)
-	}
 	log.Functionf("doActivateTail(%v) done for %s",
 		status.UUIDandVersion, status.DisplayName)
 }
@@ -1625,114 +1616,6 @@ func enableVlanFiltering(bridgeName string) error {
 				bridgeName, err)
 			log.Error(err)
 			return err
-		}
-	}
-	return nil
-}
-
-// TODO Move this to zedrouter.
-func setupVlans(vifList []types.VifInfo) error {
-	deadline := time.Now().Add(time.Minute)
-	const delay = time.Second
-	for _, vif := range vifList {
-		if vif.Vlan.End == 0 {
-			// VLAN not configured for this interface
-			continue
-		}
-
-		var err error
-		bridgeName := vif.Bridge
-		for {
-			err := enableVlanFiltering(bridgeName)
-			if err == nil {
-				break
-			}
-			if errors.Is(err, unix.EBUSY) {
-				if time.Now().Before(deadline) {
-					log.Warnf("setupVlans: bridge %s is busy, will retry in %s",
-						bridgeName, delay)
-					time.Sleep(delay)
-					continue
-				}
-			}
-			return err
-		}
-
-		var link netlink.Link
-		for {
-			link, err = netlink.LinkByName(vif.Vif)
-			if err == nil {
-				if link.Attrs().MasterIndex == 0 {
-					if time.Now().Before(deadline) {
-						log.Warnf("setupVlans: interface %s is not yet bridged, will retry in %s",
-							vif.Vif, delay)
-						time.Sleep(delay)
-						continue
-					}
-					err := fmt.Errorf("interface %s is not bridged", vif.Vif)
-					return err
-				}
-				break
-			}
-			if _, notFound := err.(netlink.LinkNotFoundError); notFound {
-				if time.Now().Before(deadline) {
-					log.Warnf("setupVlans: interface %s was not found, will retry in %s",
-						vif.Vif, delay)
-					time.Sleep(delay)
-					continue
-				}
-			}
-			err = fmt.Errorf("failed to get link '%s': %w", vif.Vif, err)
-			return err
-		}
-
-		// Switch network instances have one or zero uplinks.
-		var uplink netlink.Link
-		if vif.Vlan.SwitchUplink != "" {
-			ifName := devicenetwork.UplinkToPhysdev(log, vif.Vlan.SwitchUplink)
-			uplink, err = netlink.LinkByName(ifName)
-			if err != nil {
-				err = fmt.Errorf("failed to get uplink %s for VIF %s",
-					vif.Vlan.SwitchUplink, vif.Vif)
-				return err
-			}
-		}
-
-		if !vif.Vlan.IsTrunk {
-			vlanID := vif.Vlan.Start
-			err = netlink.BridgeVlanAdd(link, uint16(vlanID), true, true, false, false)
-			if err != nil {
-				err = fmt.Errorf("failed to configure VLAN (%d) for access port '%s': %w",
-					vif.Vlan.Start, vif.Vif, err)
-				return err
-			}
-			if uplink != nil {
-				err = netlink.BridgeVlanAdd(uplink, uint16(vlanID), false, false, false, false)
-				if err != nil {
-					err = fmt.Errorf("failed to configure VLAN (%d) for uplink trunk port '%s': %w",
-						vlanID, uplink.Attrs().Name, err)
-					return err
-				}
-			}
-		} else {
-			start := vif.Vlan.Start
-			end := vif.Vlan.End
-			for vlanID := start; vlanID <= end; vlanID++ {
-				err = netlink.BridgeVlanAdd(link, uint16(vlanID), false, false, false, false)
-				if err != nil {
-					err = fmt.Errorf("failed to configure VLAN (%d) for trunk port '%s': %w",
-						vlanID, vif.Vif, err)
-					return err
-				}
-				if uplink != nil {
-					err = netlink.BridgeVlanAdd(uplink, uint16(vlanID), false, false, false, false)
-					if err != nil {
-						err = fmt.Errorf("failed to configure VLAN (%d) for uplink trunk port '%s': %w",
-							vlanID, uplink.Attrs().Name, err)
-						return err
-					}
-				}
-			}
 		}
 	}
 	return nil
@@ -2408,6 +2291,18 @@ func handleDNSImpl(ctxArg interface{}, key string,
 	ctx := ctxArg.(*domainContext)
 	if key != "global" {
 		log.Functionf("handleDNSImpl: ignoring %s", key)
+		return
+	}
+	if status.DPCKey == "" {
+		// Do not activate PhysicalIOAdapterList subscription until NIM receives
+		// a DPC and publishes corresponding DNS.
+		// NIM can publish DNS even before it receives first DPC. In such case
+		// DPCKey is empty.
+		// The goal is to avoid assigning network ports to PCIBack if they are going to be
+		// used for management purposes. This way we avoid doing unintended port assignment
+		// to PCIBack that would be shortly followed by a release, therefore mitigating
+		// the risk of race conditions between domainmgr and NIM.
+		log.Warnf("handleDNSImpl: DNS with empty DPCKey")
 		return
 	}
 	// Ignore test status and timestamps

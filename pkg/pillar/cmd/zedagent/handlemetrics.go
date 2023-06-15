@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -29,6 +30,7 @@ import (
 	uuid "github.com/satori/go.uuid"
 	"github.com/shirou/gopsutil/host"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func handleDiskMetricCreate(ctxArg interface{}, key string,
@@ -45,16 +47,12 @@ func handleDiskMetricImpl(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
 	status := statusArg.(types.DiskMetric)
-	ctx := ctxArg.(*zedagentContext)
-	ctx.iteration++
 	path := status.DiskPath
 	log.Functionf("handleDiskMetricImpl: %s", path)
 }
 
 func handleDiskMetricDelete(ctxArg interface{}, key string, statusArg interface{}) {
 	status := statusArg.(types.DiskMetric)
-	ctx := ctxArg.(*zedagentContext)
-	ctx.iteration++
 	path := status.DiskPath
 	log.Functionf("handleDiskMetricModify: %s", path)
 }
@@ -1104,6 +1102,7 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 	ReportAppInfo.AppID = uuid
 	ReportAppInfo.SystemApp = false
 	if aiStatus != nil {
+		ReportAppInfo.AppVersion = aiStatus.UUIDandVersion.Version
 		ReportAppInfo.AppName = aiStatus.DisplayName
 		ReportAppInfo.State = aiStatus.State.ZSwState()
 		if !aiStatus.ErrorTime.IsZero() {
@@ -1156,10 +1155,15 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 		for _, ifname := range ifNames {
 			networkInfo := new(info.ZInfoNetwork)
 			networkInfo.LocalName = *proto.String(ifname)
-			ipv4Addr, ipv6Addrs, allocated, macAddr, ipAddrMismatch := getAppIP(ctx, aiStatus,
-				ifname)
-			networkInfo.IPAddrs = append([]string{ipv4Addr}, ipv6Addrs...)
-			networkInfo.MacAddr = *proto.String(macAddr)
+			ipv4Addr, ipv6Addrs, allocated, macAddr, ipAddrMismatch :=
+				getAppIP(ctx, aiStatus, ifname)
+			if ipv4Addr != nil {
+				networkInfo.IPAddrs = append(networkInfo.IPAddrs, ipv4Addr.String())
+			}
+			for _, ipv6Addr := range ipv6Addrs {
+				networkInfo.IPAddrs = append(networkInfo.IPAddrs, ipv6Addr.String())
+			}
+			networkInfo.MacAddr = *proto.String(macAddr.String())
 			networkInfo.Ipv4Up = allocated
 			networkInfo.IpAddrMisMatch = ipAddrMismatch
 			name := appIfnameToName(aiStatus, ifname)
@@ -1174,7 +1178,7 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 					networkInfo.NtpServers = append(networkInfo.NtpServers, niStatus.NtpServer.String())
 				} else {
 					ntpServers := types.GetNTPServers(*deviceNetworkStatus,
-						niStatus.SelectedUplinkIntf)
+						niStatus.SelectedUplinkIntfName)
 					for _, server := range ntpServers {
 						networkInfo.NtpServers = append(networkInfo.NtpServers, server.String())
 					}
@@ -1196,6 +1200,17 @@ func PublishAppInfoToZedCloud(ctx *zedagentContext, uuid string,
 		for _, vr := range aiStatus.VolumeRefStatusList {
 			ReportAppInfo.VolumeRefs = append(ReportAppInfo.VolumeRefs,
 				vr.VolumeID.String())
+		}
+
+		for _, snap := range aiStatus.SnapStatus.AvailableSnapshots {
+			snapInfo := new(info.ZInfoSnapshot)
+			snapInfo.Id = snap.Snapshot.SnapshotID
+			snapInfo.ConfigId = snap.ConfigVersion.UUID.String()
+			snapInfo.ConfigVersion = snap.ConfigVersion.Version
+			snapInfo.CreateTime = timestamppb.New(snap.TimeCreated)
+			snapInfo.Type = snap.Snapshot.SnapshotType.ConvertToInfoSnapshotType()
+			snapInfo.SnapErr = encodeErrorInfo(snap.Error)
+			ReportAppInfo.Snapshots = append(ReportAppInfo.Snapshots, snapInfo)
 		}
 	}
 
@@ -1485,7 +1500,6 @@ func PublishEdgeviewToZedCloud(ctx *zedagentContext,
 	//but if there is a queue we'll retry sending the highest priority message.
 	queueInfoToDest(ctx, dest, "global", buf, size, bailOnHTTPErr, false, forcePeriodic,
 		info.ZInfoTypes_ZiEdgeview)
-	ctx.iteration++
 }
 
 func appIfnameToNetworkInstance(ctx *zedagentContext,
@@ -1596,7 +1610,7 @@ func sendMetricsProtobuf(ctx *getconfigContext,
 // Use the ifname/vifname to find the underlay status
 // and from there the (ip, allocated, mac) addresses for the app
 func getAppIP(ctx *zedagentContext, aiStatus *types.AppInstanceStatus,
-	vifname string) (string, []string, bool, string, bool) {
+	vifname string) (net.IP, []net.IP, bool, net.HardwareAddr, bool) {
 
 	log.Tracef("getAppIP(%s, %s)", aiStatus.Key(), vifname)
 	for _, ulStatus := range aiStatus.UnderlayNetworks {
@@ -1606,9 +1620,10 @@ func getAppIP(ctx *zedagentContext, aiStatus *types.AppInstanceStatus,
 		log.Tracef("getAppIP(%s, %s) found underlay v4: %s, v6: %s, ipv4 assigned %v mac %s",
 			aiStatus.Key(), vifname, ulStatus.AllocatedIPv4Addr,
 			ulStatus.AllocatedIPv6List, ulStatus.IPv4Assigned, ulStatus.Mac)
-		return ulStatus.AllocatedIPv4Addr, ulStatus.AllocatedIPv6List, ulStatus.IPv4Assigned, ulStatus.Mac, ulStatus.IPAddrMisMatch
+		return ulStatus.AllocatedIPv4Addr, ulStatus.AllocatedIPv6List, ulStatus.IPv4Assigned,
+			ulStatus.Mac, ulStatus.IPAddrMisMatch
 	}
-	return "", []string{}, false, "", false
+	return nil, nil, false, nil, false
 }
 
 func createVolumeInstanceMetrics(ctx *zedagentContext, reportMetrics *metrics.ZMetricMsg) {

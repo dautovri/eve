@@ -4,6 +4,10 @@
 #
 # [1] A poor man is a man on a deadline.
 #
+
+# if this has problems, it should fail right away
+set -e
+
 EVE="$(cd "$(dirname "$0")" && pwd)/../"
 PATH="$EVE/build-tools/bin:$PATH"
 
@@ -27,7 +31,7 @@ _linuxkit_tag() {
     local -a build_yml_cmd
 
     if [[ "${is_dev_build}" == 1 ]]; then
-      build_yml_cmd=(-build-yml build-dev.yml)
+      build_yml_cmd=(--build-yml build-dev.yml)
     fi
 
     echo "$(linuxkit pkg show-tag "${build_yml_cmd[@]}" ${EVE_HASH:+--hash $EVE_HASH} "${EVE}/${pkg}")${ARCH}"
@@ -117,6 +121,7 @@ KEXEC_TAG=${KEXEC_TAG}
 KDUMP_TAG=${KDUMP_TAG}
 MEASURE_CONFIG_TAG=${MEASURE_CONFIG_TAG}
 BSP_IMX_TAG=${BSP_IMX_TAG}
+APPARMOR_TAG=${APPARMOR_TAG}
 EOF
 }
 
@@ -168,6 +173,7 @@ KEXEC_TAG=$(linuxkit_tag pkg/kexec)
 KDUMP_TAG=$(linuxkit_tag pkg/kdump)
 MEASURE_CONFIG_TAG=$(linuxkit_tag pkg/measure-config)
 BSP_IMX_TAG=$(linuxkit_tag pkg/bsp-imx)
+APPARMOR_TAG=$(linuxkit_tag pkg/apparmor)
 
 # Synthetic tags: the following tags are based on hashing
 # the contents of all the Dockerfile.in that we can find.

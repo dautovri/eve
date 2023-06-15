@@ -264,7 +264,7 @@ func (s *ociSpec) CreateContainer(removeExisting bool) error {
 func (s *ociSpec) AdjustMemLimit(dom types.DomainConfig, addMemory int64) {
 	// update cgroup resource constraints for CPU and memory
 	if s.Linux != nil {
-		m := int64(dom.Memory*1024) + addMemory
+		m := int64(dom.Memory)*1024 + addMemory
 		s.Linux.Resources.Memory.Limit = &m
 	}
 }
@@ -286,11 +286,12 @@ func (s *ociSpec) UpdateVifList(vifs []types.VifConfig) {
 		Timeout: &timeout,
 	})
 	for _, v := range vifs {
-		vifSpec := []string{"VIF_NAME=" + v.Vif, "VIF_BRIDGE=" + v.Bridge, "VIF_MAC=" + v.Mac}
+		vifSpec := []string{"VIF_NAME=" + v.Vif, "VIF_BRIDGE=" + v.Bridge,
+			"VIF_MAC=" + v.Mac.String()}
 		s.Hooks.Prestart = append(s.Hooks.Prestart, specs.Hook{
 			Env:     vifSpec,
 			Path:    eveScript,
-			Args:    append(vethScript, "up", v.Vif, v.Bridge, v.Mac),
+			Args:    append(vethScript, "up", v.Vif, v.Bridge, v.Mac.String()),
 			Timeout: &timeout,
 		})
 		s.Hooks.Poststop = append(s.Hooks.Poststop, specs.Hook{
@@ -321,7 +322,7 @@ func (s *ociSpec) UpdateFromDomain(dom *types.DomainConfig, status *types.Domain
 			s.Linux.Resources.CPU = &specs.LinuxCPU{}
 		}
 
-		m := int64(dom.Memory * 1024)
+		m := int64(dom.Memory) * 1024
 		p := uint64(100000)
 		q := int64(100000 * dom.VCpus)
 		s.Linux.Resources.Memory.Limit = &m

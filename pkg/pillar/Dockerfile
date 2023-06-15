@@ -85,6 +85,7 @@ ENV CGO_ENABLED=1
 ENV GOOS=linux
 ENV GOARCH=${TARGETARCH}
 ENV CC=${CROSS_COMPILE_ENV}gcc
+ARG GOPKGVERSION
 
 COPY pillar-patches/* /patches/
 RUN set -e && for patch in ../patches/*.patch; do \
@@ -96,7 +97,7 @@ RUN set -e && for patch in ../patches/*.patch; do \
 RUN --mount=type=cache,target=/root/.cache/go-build echo "Running go vet" && go vet ./... && \
     echo "Running go fmt" && ERR="$(find . -name \*.go | grep -v /vendor/ | xargs gofmt -d -e -l -s)" && \
        if [ -n "$ERR" ] ; then printf 'go fmt Failed - ERR: %s' "$ERR" ; exit 1 ; fi && \
-       make DEV="$DEV" RSTATS=$RSTATS RSTATS_ENDPOINT=$RSTATS_ENDPOINT RSTATS_TAG=$RSTATS_TAG DISTDIR=/final/opt/zededa/bin build
+       make DEV="$DEV" RSTATS=$RSTATS RSTATS_ENDPOINT=$RSTATS_ENDPOINT RSTATS_TAG=$RSTATS_TAG DISTDIR=/final/opt/zededa/bin BUILD_VERSION=${GOPKGVERSION} build
 
 WORKDIR /
 
@@ -113,7 +114,7 @@ fi
 
 FROM lfedge/eve-fscrypt:0b7cc0d9d620e47fc54e21d56cb8a5cd224f9c9b as fscrypt
 FROM lfedge/eve-dnsmasq:3af908d86a95a627c729e09b1b125bf8de7fadcb as dnsmasq
-FROM lfedge/eve-gpt-tools:ab2e9f924e22709b4e08ebedd6d3c6a2882d071e as gpttools
+FROM lfedge/eve-gpt-tools:51ecda7bc185c655c1d0423228dc83e29d4c674d as gpttools
 
 # collector collects everything together and then does any processing like stripping binaries.
 # We use this interim "collector" so that we can do processing.
