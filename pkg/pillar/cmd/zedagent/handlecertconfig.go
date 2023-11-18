@@ -8,15 +8,19 @@ package zedagent
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
-	"github.com/lf-edge/eve/api/go/attest"
-	zcert "github.com/lf-edge/eve/api/go/certs"
-	zconfig "github.com/lf-edge/eve/api/go/config"
-	"github.com/lf-edge/eve/api/go/evecommon"
+	"github.com/lf-edge/eve-api/go/attest"
+	zcert "github.com/lf-edge/eve-api/go/certs"
+	zconfig "github.com/lf-edge/eve-api/go/config"
+	"github.com/lf-edge/eve-api/go/evecommon"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -233,20 +237,42 @@ func controllerCertsTask(ctx *zedagentContext, triggerCerts <-chan struct{}) {
 	}
 }
 
+func verifySigningCertNewest(ctx *zedagentContext, certByte []byte) error {
+	block, _ := pem.Decode(certByte)
+	if block == nil {
+		err := fmt.Errorf("verifyCertNewest: pem.Decode() failed")
+		return err
+	}
+	newCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		err = fmt.Errorf("verifyCertNewest: x509.ParseCertificate() failed: %w", err)
+		return err
+	}
+	err = zedcloud.LoadSavedServerSigningCert(zedcloudCtx)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Certificates were not loaded, accept
+			return nil
+		}
+		err = fmt.Errorf("verifyCertNewest: LoadSavedServerSigningCert() failed: %w", err)
+		return err
+	}
+	oldCert := zedcloudCtx.ServerSigningCert
+	if newCert.NotBefore.Before(oldCert.NotBefore) {
+		err = fmt.Errorf("verifyCertNewest: received old signing certificate, new.NotBefore '%v' < '%v' old.NotBefore",
+			newCert.NotBefore, oldCert.NotBefore)
+		return err
+	}
+
+	return nil
+}
+
 // Fetch and verify the controller certificates. Returns true if certificates have
 // not changed or the update was successfully applied.
 // False is returned if the function failed to fetch/verify/unmarshal certs.
-func getCertsFromController(ctx *zedagentContext, desc string) (success bool) {
+func requestCertsByURL(ctx *zedagentContext, certURL string, desc string,
+	requireSigningCertNewest bool) bool {
 	log.Functionf("getCertsFromController started for %s", desc)
-	certURL := zedcloud.URLPathString(serverNameAndPort,
-		zedcloudCtx.V2API, nilUUID, "certs")
-
-	// not V2API
-	if !zedcloud.UseV2API() {
-		log.Noticef("getCertsFromController not V2API!")
-		return false
-	}
-
 	ctxWork, cancel := zedcloud.GetContextForAllIntfFunctions(zedcloudCtx)
 	defer cancel()
 
@@ -314,6 +340,15 @@ func getCertsFromController(ctx *zedagentContext, desc string) (success bool) {
 		return false
 	}
 
+	// verify if signing certificate is the newest
+	if requireSigningCertNewest {
+		err := verifySigningCertNewest(ctx, signingCertBytes)
+		if err != nil {
+			log.Error(err)
+			return false
+		}
+	}
+
 	// manage the certificates through pubsub
 	changed, err := parseControllerCerts(ctx, rv.RespContents)
 	if err != nil {
@@ -333,6 +368,48 @@ func getCertsFromController(ctx *zedagentContext, desc string) (success bool) {
 
 	log.Noticef("getCertsFromController: success for %s", desc)
 	return true
+}
+
+// Fetch and verify the controller certificates. Returns true if certificates
+// have not changed or the update was successfully applied. False is returned
+// if the function failed to fetch/verify/unmarshal certs.
+//
+// If main controller is unavailable (@false is returned), the next set of
+// attempts is to fallback to retrieve certs from the LOC.
+func getCertsFromController(ctx *zedagentContext, desc string) bool {
+	// not V2API
+	if !zedcloud.UseV2API() {
+		log.Noticef("getCertsFromController not V2API!")
+		return false
+	}
+	url := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
+		nilUUID, "certs")
+
+	// Controller is in the power to push us outdated certs.
+	// Do not question the power of the controller, this is
+	// insubordition.
+	requireSigningCertNewest := false
+
+	rv := requestCertsByURL(ctx, url, desc, requireSigningCertNewest)
+	if !rv {
+		log.Warningf("getCertsFromController: fetching certs from controller failed")
+	}
+	if !rv && ctx.getconfigCtx.sideController.locConfig != nil {
+		locURL := ctx.getconfigCtx.sideController.locConfig.LocURL
+		url = zedcloud.URLPathString(locURL, zedcloudCtx.V2API,
+			nilUUID, "certs")
+
+		// Don't let LOC push us outdated certs
+		requireSigningCertNewest := true
+
+		// Request certs from LOC if previous request has failed and LOC
+		// configuration exists and is valid
+		rv = requestCertsByURL(ctx, url, desc, requireSigningCertNewest)
+		log.Warningf("getCertsFromController: certs were requested from the LOC with the result '%v'",
+			rv)
+	}
+
+	return rv
 }
 
 // edge node certificate post task, on change trigger
@@ -509,6 +586,13 @@ func triggerEdgeNodeCertEvent(ctxPtr *zedagentContext) {
 	default:
 		log.Warnf("triggerEdgeNodeCertEvent(): already triggered, still not processed")
 	}
+}
+
+func triggerEdgeNodeCertDelayedEvent(ctxPtr *zedagentContext, d time.Duration) {
+	go func() {
+		time.Sleep(d)
+		triggerEdgeNodeCertEvent(ctxPtr)
+	}()
 }
 
 func convertLocalToApiHashAlgo(algo types.CertHashType) evecommon.HashAlgorithm {

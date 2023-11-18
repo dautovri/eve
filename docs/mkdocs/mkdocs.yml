@@ -22,8 +22,8 @@ nav:
   - 'EVE Configuration': 'docs/CONFIG.md'
   - 'BIOS and Firmware management with EVE': 'docs/BIOS-FIRMWARE.md'
   - 'Deploying EVE-OS': 'docs/DEPLOYMENT.md'
+  - 'Verifying EVE-OS': 'docs/HARDWARE-VERIFICATION.md'
   - 'Booting EVE': 'docs/BOOTING.md'
-  - 'Device Connectivity': 'docs/DEVICE-CONNECTIVITY.md'
   - Communications: 'docs/COMMS.md'
   - Registration: 'docs/REGISTRATION.md'
   - 'Update base image': 'docs/BASEIMAGE-UPDATE.md'
@@ -35,7 +35,6 @@ nav:
   - IPC: 'docs/IPC.md'
   - 'Keys and Certificates': 'docs/KEYS-AND-CERTS.md'
   - 'LED indication': 'docs/LED-INDICATION.md'
-  - Wireless: 'docs/WIRELESS.md'
   - Tasks: 'docs/TASKS.md'
   - Upstreaming: 'docs/UPSTREAMING.md'
   - 'Bringing EVE up on a new CPU architecture': 'docs/PORTING.md'
@@ -46,8 +45,11 @@ nav:
   - CI-CD: 'docs/CI-CD.md'
   - FAQ: 'docs/FAQ.md'
   - Networking:
+      - 'Device Connectivity': 'docs/DEVICE-CONNECTIVITY.md'
       - 'Network ACLS': 'docs/NETWORK-ACLS.md'
       - 'Network Models': 'docs/NETWORK-MODELS.md'
+      - Wireless: 'docs/WIRELESS.md'
+      - 'wwan microservice': 'pkg/wwan/README.md'
   - 'ECO Initialization':
       - Initialization: 'docs/ECO-INIT.md'
       - 'ECO Metadata': 'docs/ECO-METADATA.md'
@@ -61,6 +63,7 @@ nav:
   - Storage:
       - 'RAID configuration': 'docs/STORAGE-RAID-CONFIGURATION.md'
       - ZFS: 'docs/ZFS.md'
+      - 'Application Snapshot, API': 'docs/APP-SNAPSHOT.md'
   - Boards:
       - 'NVIDIA Jetson': 'boards/nvidia/jetson/README.md'
   - Debugging:
@@ -111,7 +114,8 @@ nav:
       - volumemgr: 'pkg/pillar/docs/volumemgr.md'
       - zedmanager: 'pkg/pillar/docs/zedmanager.md'
       - zedrouter: 'pkg/pillar/docs/zedrouter.md'
-      - zedUpload: 'pkg/pillar/vendor/github.com/lf-edge/eve/libs/zedUpload/README.md'
+      - 'Application Snapshot, Implementation': 'pkg/pillar/docs/app-snapshot.md'
+      - zedUpload: 'pkg/pillar/vendor/github.com/lf-edge/eve-libs/zedUpload/README.md'
       - go-ieproxy: 'pkg/pillar/vendor/github.com/mattn/go-ieproxy/README.md'
       - dns: 'pkg/pillar/vendor/github.com/miekg/dns/README.md'
       - go-homedir: 'pkg/pillar/vendor/github.com/mitchellh/go-homedir/README.md'
@@ -217,3 +221,4 @@ nav:
       - U-boot: 'pkg/u-boot/README.md'
       - UEFI: 'pkg/uefi/rpi/README.md'
       - WLAN: 'pkg/wlan/FIXME.md'
+      - 'Clock Synchronization': 'docs/CLOCK-SYNCHRONIZATION.md'

@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/lf-edge/eve/api/go/info"
+	"github.com/lf-edge/eve-api/go/info"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	etpm "github.com/lf-edge/eve/pkg/pillar/evetpm"
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -117,7 +117,7 @@ func (h *Ext4Handler) SetupDefaultVault() error {
 		return fmt.Errorf("error in setting up vault %s:%v", defaultVault, err)
 	}
 	// Log the type of key used for unlocking default vault
-	h.log.Noticef("default vault unlocked using key type %s",
+	h.log.Noticef("default vault unlocked using key type: %s",
 		etpm.CompareLegacyandSealedKey().String())
 	return nil
 }

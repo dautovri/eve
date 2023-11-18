@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	zconfig "github.com/lf-edge/eve/api/go/config"
+	zconfig "github.com/lf-edge/eve-api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -517,9 +517,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	subZVolStatus.Activate()
 
 	subVolumesSnapshotConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		CreateHandler: handleVolumesSnapshotCreate,
-		ModifyHandler: handleVolumesSnapshotModify,
-		DeleteHandler: handleVolumesSnapshotDelete,
+		CreateHandler: handleVolumesSnapshotConfigCreate,
+		ModifyHandler: handleVolumesSnapshotConfigModify,
+		DeleteHandler: handleVolumesSnapshotConfigDelete,
 		WarningTime:   warningTime,
 		ErrorTime:     errorTime,
 		AgentName:     "zedmanager",
@@ -534,9 +534,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	pubVolumesSnapshotStatus, err := ps.NewPublication(
 		pubsub.PublicationOptions{
-			AgentName:  agentName,
-			TopicType:  types.VolumesSnapshotStatus{},
-			Persistent: true,
+			AgentName: agentName,
+			TopicType: types.VolumesSnapshotStatus{},
 		},
 	)
 	if err != nil {

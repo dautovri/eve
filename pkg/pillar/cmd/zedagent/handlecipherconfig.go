@@ -10,7 +10,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	zconfig "github.com/lf-edge/eve/api/go/config"
+	zconfig "github.com/lf-edge/eve-api/go/config"
+	zcommon "github.com/lf-edge/eve-api/go/evecommon"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 )
 
@@ -86,7 +87,7 @@ func parseCipherContext(ctx *getconfigContext,
 // parseCipherBlock : will collate all the relevant information
 // ciphercontext will be used to get the certs and encryption schemes
 // should be run after parseCipherContext
-func parseCipherBlock(ctx *getconfigContext, key string, cfgCipherBlock *zconfig.CipherBlock) types.CipherBlockStatus {
+func parseCipherBlock(ctx *getconfigContext, key string, cfgCipherBlock *zcommon.CipherBlock) types.CipherBlockStatus {
 
 	log.Functionf("parseCipherBlock(%s) started", key)
 	if cfgCipherBlock == nil {

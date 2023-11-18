@@ -176,10 +176,11 @@ func (z *zedrouter) handleNetworkInstanceCreate(ctxArg interface{}, key string,
 		return
 	}
 
-	if err := z.doNetworkInstanceSanityCheck(&status); err != nil {
+	if niConflict, err := z.doNetworkInstanceSanityCheck(&config); err != nil {
 		z.log.Error(err)
 		status.SetErrorNow(err.Error())
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
+		status.NIConflict = niConflict
 		z.publishNetworkInstanceStatus(&status)
 		return
 	}
@@ -295,11 +296,12 @@ func (z *zedrouter) handleNetworkInstanceModify(ctxArg interface{}, key string,
 
 	prevPortLL := status.PortLogicalLabel
 	status.NetworkInstanceConfig = config
-	if err := z.doNetworkInstanceSanityCheck(status); err != nil {
+	if niConflict, err := z.doNetworkInstanceSanityCheck(&config); err != nil {
 		z.log.Error(err)
 		status.SetErrorNow(err.Error())
 		status.WaitingForUplink = false
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
+		status.NIConflict = niConflict
 		z.publishNetworkInstanceStatus(status)
 		return
 	}
@@ -391,6 +393,9 @@ func (z *zedrouter) handleNetworkInstanceModify(ctxArg interface{}, key string,
 	} else if status.Activated {
 		z.doUpdateActivatedNetworkInstance(config, status)
 	}
+
+	// Check if some inter-NI conflicts were resolved by this modification.
+	z.checkConflictingNetworkInstances()
 	z.log.Functionf("handleNetworkInstanceModify(%s) done", key)
 }
 
@@ -407,6 +412,8 @@ func (z *zedrouter) handleNetworkInstanceDelete(ctxArg interface{}, key string,
 	z.publishNetworkInstanceStatus(status)
 
 	done := z.maybeDelOrInactivateNetworkInstance(status)
+	// Check if some inter-NI conflicts were resolved by this delete.
+	z.checkConflictingNetworkInstances()
 	z.log.Functionf("handleNetworkInstanceDelete(%s) done %t", key, done)
 }
 
@@ -432,15 +439,19 @@ func (z *zedrouter) handleAppNetworkCreate(ctxArg interface{}, key string,
 	// Start by marking with PendingAdd
 	status := types.AppNetworkStatus{
 		UUIDandVersion: config.UUIDandVersion,
-		PendingAdd:     true,
 		DisplayName:    config.DisplayName,
 	}
 	z.doCopyAppNetworkConfigToStatus(config, &status)
+	status.PendingAdd = true
+	z.publishAppNetworkStatus(&status)
+	defer func() {
+		status.PendingAdd = false
+		z.publishAppNetworkStatus(&status)
+	}()
 
 	if err := z.validateAppNetworkConfig(config); err != nil {
 		z.log.Errorf("handleAppNetworkCreate(%v): validation failed: %v",
 			config.UUIDandVersion.UUID, err)
-		status.PendingAdd = false
 		z.addAppNetworkError(&status, "handleAppNetworkCreate", err)
 		return
 	}
@@ -453,45 +464,37 @@ func (z *zedrouter) handleAppNetworkCreate(ctxArg interface{}, key string,
 		err = fmt.Errorf("failed to allocate appNum for %s/%s: %v",
 			config.UUIDandVersion.UUID, config.DisplayName, err)
 		z.log.Errorf("handleAppNetworkCreate(%v): %v", config.UUIDandVersion.UUID, err)
-		status.PendingAdd = false
 		z.addAppNetworkError(&status, "handleAppNetworkCreate", err)
 		return
 	}
 	status.AppNum = appNum
 	z.publishAppNetworkStatus(&status)
 
-	// Allocate application numbers on underlay network.
+	// Allocate application numbers on network instances.
 	// Used to allocate VIF IP address.
-	err = z.allocateAppIntfNums(config.UUIDandVersion.UUID, config.UnderlayNetworkList)
+	err = z.allocateAppIntfNums(config.UUIDandVersion.UUID, config.AppNetAdapterList)
 	if err != nil {
 		err = fmt.Errorf("failed to allocate numbers for VIFs of the app %s/%s: %v",
 			config.UUIDandVersion.UUID, config.DisplayName, err)
 		z.log.Errorf("handleAppNetworkCreate(%v): %v", config.UUIDandVersion.UUID, err)
-		status.PendingAdd = false
 		z.addAppNetworkError(&status, "handleAppNetworkCreate", err)
 		return
 	}
 
-	// Check that Network exists for all underlays.
+	// Check that Network exists for all AppNetAdapters.
 	// We look for apps with raised AwaitNetworkInstance when a NetworkInstance is added.
 	netInErrState, err := z.checkNetworkReferencesFromApp(config)
 	if err != nil {
 		z.log.Errorf("handleAppNetworkCreate(%v): %v", config.UUIDandVersion.UUID, err)
 		status.AwaitNetworkInstance = true
-		status.PendingAdd = false
 		if netInErrState {
 			z.addAppNetworkError(&status, "handleAppNetworkCreate", err)
-		} else {
-			z.publishAppNetworkStatus(&status)
 		}
 		return
 	}
 
 	if config.Activate {
 		z.doActivateAppNetwork(config, &status)
-	} else {
-		status.PendingAdd = false
-		z.publishAppNetworkStatus(&status)
 	}
 
 	z.maybeScheduleRetry()
@@ -499,7 +502,7 @@ func (z *zedrouter) handleAppNetworkCreate(ctxArg interface{}, key string,
 }
 
 // handleAppNetworkModify cannot handle any change.
-// For example, the number of underlay networks can not be changed.
+// For example, the number of AppNetAdapters can not be changed.
 func (z *zedrouter) handleAppNetworkModify(ctxArg interface{}, key string,
 	configArg interface{}, oldConfigArg interface{}) {
 	newConfig := configArg.(types.AppNetworkConfig)
@@ -512,12 +515,15 @@ func (z *zedrouter) handleAppNetworkModify(ctxArg interface{}, key string,
 	status.ClearError()
 	status.PendingModify = true
 	z.publishAppNetworkStatus(status)
+	defer func() {
+		status.PendingModify = false
+		z.publishAppNetworkStatus(status)
+	}()
 
 	// Check for unsupported/invalid changes.
 	if err := z.validateAppNetworkConfigForModify(newConfig, oldConfig); err != nil {
 		z.log.Errorf("handleAppNetworkModify(%v): validation failed: %v",
 			newConfig.UUIDandVersion.UUID, err)
-		status.PendingModify = false
 		z.addAppNetworkError(status, "handleAppNetworkModify", err)
 		return
 	}
@@ -525,17 +531,14 @@ func (z *zedrouter) handleAppNetworkModify(ctxArg interface{}, key string,
 	// Update numbers allocated for application interfaces.
 	z.checkAppNetworkModifyAppIntfNums(newConfig, status)
 
-	// Check that Network exists for all new underlays.
+	// Check that Network exists for all new AppNetAdapters.
 	// We look for apps with raised AwaitNetworkInstance when a NetworkInstance is added.
 	netInErrState, err := z.checkNetworkReferencesFromApp(newConfig)
 	if err != nil {
 		z.log.Errorf("handleAppNetworkModify(%v): %v", newConfig.UUIDandVersion.UUID, err)
 		status.AwaitNetworkInstance = true
-		status.PendingModify = false
 		if netInErrState {
 			z.addAppNetworkError(status, "handleAppNetworkModify", err)
-		} else {
-			z.publishAppNetworkStatus(status)
 		}
 		return
 	}
@@ -543,15 +546,12 @@ func (z *zedrouter) handleAppNetworkModify(ctxArg interface{}, key string,
 	if !newConfig.Activate && status.Activated {
 		z.doInactivateAppNetwork(newConfig, status)
 		z.doCopyAppNetworkConfigToStatus(newConfig, status)
-		z.publishAppNetworkStatus(status)
 	} else if newConfig.Activate && !status.Activated {
 		z.doCopyAppNetworkConfigToStatus(newConfig, status)
 		z.doActivateAppNetwork(newConfig, status)
 	} else if !status.Activated {
 		// Just copy in newConfig
 		z.doCopyAppNetworkConfigToStatus(newConfig, status)
-		status.PendingModify = false
-		z.publishAppNetworkStatus(status)
 	} else { // Config change while application network is active.
 		z.doUpdateActivatedAppNetwork(oldConfig, newConfig, status)
 	}
@@ -577,6 +577,8 @@ func (z *zedrouter) handleAppNetworkDelete(ctxArg interface{}, key string,
 
 	// Deactivate app network if it is currently activated.
 	if status.Activated {
+		// No need to clear PendingDelete later. Instead, we un-publish
+		// the status completely few lines below.
 		status.PendingDelete = true
 		z.publishAppNetworkStatus(status)
 		z.doInactivateAppNetwork(config, status)
@@ -596,9 +598,9 @@ func (z *zedrouter) handleAppNetworkDelete(ctxArg interface{}, key string,
 	z.freeAppIntfNums(status)
 
 	// Did this free up any last references against any deleted Network Instance?
-	for i := range status.UnderlayNetworkList {
-		ulStatus := &status.UnderlayNetworkList[i]
-		netstatus := z.lookupNetworkInstanceStatus(ulStatus.Network.String())
+	for i := range status.AppNetAdapterList {
+		adapterStatus := &status.AppNetAdapterList[i]
+		netstatus := z.lookupNetworkInstanceStatus(adapterStatus.Network.String())
 		if netstatus != nil {
 			if z.maybeDelOrInactivateNetworkInstance(netstatus) {
 				z.log.Functionf(
@@ -626,4 +628,130 @@ func (z *zedrouter) handleAppInstDelete(ctxArg interface{}, key string,
 	// Clean up appInst Metadata
 	z.unpublishAppInstMetadata(appInstMetadata)
 	z.log.Functionf("handleAppInstDelete(%s) done", key)
+}
+
+func (z *zedrouter) handlePatchEnvelopeImpl(peInfo types.PatchEnvelopeInfoList) {
+	z.patchEnvelopes.UpdateEnvelopes(peInfo.Envelopes)
+
+	z.triggerPEUpdate()
+}
+
+func (z *zedrouter) handlePatchEnvelopeCreate(ctxArg interface{}, key string,
+	configArg interface{}) {
+	peInfo := configArg.(types.PatchEnvelopeInfoList)
+	z.log.Functionf("handlePatchEnvelopeCreate: (UUID: %s) %v", key, peInfo.Envelopes)
+
+	z.handlePatchEnvelopeImpl(peInfo)
+
+	z.log.Functionf("handlePatchEnvelopeCreate(%s) done", key)
+}
+
+func (z *zedrouter) handlePatchEnvelopeModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	peInfo := statusArg.(types.PatchEnvelopeInfoList)
+	z.log.Functionf("handlePatchEnvelopeModify: (UUID: %s) %v", key, peInfo.Envelopes)
+
+	z.handlePatchEnvelopeImpl(peInfo)
+
+	z.log.Functionf("handlePatchEnvelopeModify(%s) done", key)
+}
+
+func (z *zedrouter) handlePatchEnvelopeDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	z.log.Functionf("handlePatchEnvelopeDelete: (UUID: %s)", key)
+
+	z.handlePatchEnvelopeImpl(types.PatchEnvelopeInfoList{})
+
+	z.log.Functionf("handlePatchEnvelopeDelete(%s) done", key)
+}
+
+func (z *zedrouter) handleContentTreeStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	contentTree := statusArg.(types.ContentTreeStatus)
+	z.log.Functionf("handleContentTreeStatusCreate: (UUID: %s, name:%s)",
+		key, contentTree.DisplayName)
+
+	z.patchEnvelopes.UpdateContentTree(contentTree, false)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleContentTreeStatusCreate(%s) done", key)
+}
+
+func (z *zedrouter) handleContentTreeStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+
+	contentTree := statusArg.(types.ContentTreeStatus)
+	z.log.Functionf("handleContentTreeStatusModify: (UUID: %s), name:%s",
+		key, contentTree.DisplayName)
+
+	z.patchEnvelopes.UpdateContentTree(contentTree, false)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleContentTreeStatusModify(%s) done", key)
+
+}
+
+func (z *zedrouter) handleContentTreeStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	contentTree := statusArg.(types.ContentTreeStatus)
+	z.log.Functionf("handleVolumeStatusDelete: (UUID: %s, name:%s)",
+		key, contentTree.DisplayName)
+
+	z.patchEnvelopes.UpdateContentTree(contentTree, true)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleContentTreeStatusDelete(%s) done", key)
+
+}
+
+func (z *zedrouter) handleVolumeStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	volume := statusArg.(types.VolumeStatus)
+	z.log.Functionf("handleVolumeStatusCreate: (UUID: %s, name:%s)",
+		key, volume.DisplayName)
+
+	z.patchEnvelopes.UpdateVolumeStatus(volume, false)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleVolumeStatusCreate(%s) done", key)
+}
+
+func (z *zedrouter) handleVolumeStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+
+	volume := statusArg.(types.VolumeStatus)
+	z.log.Functionf("handleVolumeStatusModify: (UUID: %s), name:%s",
+		key, volume.DisplayName)
+
+	z.patchEnvelopes.UpdateVolumeStatus(volume, false)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleVolumeStatusModify(%s) done", key)
+}
+
+func (z *zedrouter) handleVolumeStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	volume := statusArg.(types.VolumeStatus)
+	z.log.Functionf("handleVolumeStatusDelete: (UUID: %s, name:%s)",
+		key, volume.DisplayName)
+
+	z.patchEnvelopes.UpdateVolumeStatus(volume, true)
+
+	z.triggerPEUpdate()
+
+	z.log.Functionf("handleVolumeStatusDelete(%s) done", key)
+}
+
+func (z *zedrouter) triggerPEUpdate() {
+	select {
+	case z.patchEnvelopes.UpdateStateNotificationCh() <- struct{}{}:
+		z.log.Function("triggerPEUpdate sent update")
+	default:
+		z.log.Warn("patchEnvelopes did not sent update. Slow handler?")
+	}
 }

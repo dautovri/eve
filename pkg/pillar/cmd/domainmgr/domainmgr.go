@@ -9,6 +9,7 @@
 package domainmgr
 
 import (
+	"bufio"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -22,7 +23,7 @@ import (
 
 	"github.com/containerd/cgroups"
 	"github.com/google/go-cmp/cmp"
-	zconfig "github.com/lf-edge/eve/api/go/config"
+	zconfig "github.com/lf-edge/eve-api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -38,6 +39,8 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/sriov"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
+	"github.com/lf-edge/eve/pkg/pillar/utils/cloudconfig"
+	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
@@ -316,7 +319,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	domainCtx.decryptCipherContext.Log = log
 	domainCtx.decryptCipherContext.AgentName = agentName
 	domainCtx.decryptCipherContext.AgentMetrics = domainCtx.cipherMetrics
-	domainCtx.decryptCipherContext.SubControllerCert = subControllerCert
+	domainCtx.decryptCipherContext.PubSubControllerCert = subControllerCert
 	subControllerCert.Activate()
 
 	// Look for edge node certs which will be used for decryption
@@ -333,7 +336,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	if err != nil {
 		log.Fatal(err)
 	}
-	domainCtx.decryptCipherContext.SubEdgeNodeCert = subEdgeNodeCert
+	domainCtx.decryptCipherContext.PubSubEdgeNodeCert = subEdgeNodeCert
 	subEdgeNodeCert.Activate()
 
 	// Look for global config such as log levels
@@ -537,9 +540,20 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	domainCtx.cpuPinningSupported = caps.CPUPinning
 
-	resources, err := hyper.GetHostCPUMem()
-	if err != nil {
-		log.Fatal(err)
+	// Need to wait for things to get started
+	var resources types.HostMemory
+	for i := 0; true; i++ {
+		delay := 10
+		resources, err = hyper.GetHostCPUMem()
+		if err == nil {
+			break
+		}
+		if i == 10 {
+			log.Fatalf("Failed %d times due to %s", i, err)
+		}
+		log.Warnf("Retrying in %d seconds due to %s", delay, err)
+		time.Sleep(time.Duration(delay) * time.Second)
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 
 	cpusReserved, err := getReservedCPUsNum()
@@ -1393,6 +1407,37 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 	return nil
 }
 
+func getVersionFromMetaFile(path string) (uint64, error) {
+	var curCIVersion uint64
+
+	// read cloud init version from the meta-data file
+	metafile, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to open meta-data file: %s", err)
+	}
+	scanner := bufio.NewScanner(metafile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "instance-id:") {
+			parts := strings.Split(line, "/")
+			if len(parts) >= 2 {
+				curCIVersion, err = strconv.ParseUint(parts[1], 10, 32)
+				if err != nil {
+					return 0, fmt.Errorf("Failed to parse cloud init version: %s", err.Error())
+				}
+				return curCIVersion, nil
+			}
+		}
+	}
+
+	// Check for scanner errors.
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("Reading the file failed: %s", err.Error())
+	}
+
+	return 0, errors.New("Version not found in meta-data file")
+}
+
 func doActivate(ctx *domainContext, config types.DomainConfig,
 	status *types.DomainStatus) {
 
@@ -1452,12 +1497,53 @@ func doActivate(ctx *domainContext, config types.DomainConfig,
 			// do nothing
 		case zconfig.Format_CONTAINER:
 			snapshotID := containerd.GetSnapshotID(ds.FileLocation)
-			if err := ctx.casClient.MountSnapshot(snapshotID, cas.GetRoofFsPath(ds.FileLocation)); err != nil {
+			rootPath := cas.GetRoofFsPath(ds.FileLocation)
+			if err := ctx.casClient.MountSnapshot(snapshotID, rootPath); err != nil {
 				err := fmt.Errorf("doActivate: Failed mount snapshot: %s for %s. Error %s",
 					snapshotID, config.UUIDandVersion.UUID, err)
 				log.Error(err.Error())
 				status.SetErrorNow(err.Error())
 				return
+			}
+
+			metadataPath := filepath.Join(rootPath, "meta-data")
+
+			// get current cloud init version
+			curCIVersion, err := getVersionFromMetaFile(metadataPath)
+			if err != nil {
+				curCIVersion = 0 // make sure the cloud init config gets executed
+			}
+
+			// get new cloud init version
+			newCIVersion, err := strconv.ParseUint(getCloudInitVersion(config), 10, 32)
+			if err != nil {
+				log.Error("Failed to parse cloud init version: ", err)
+				newCIVersion = curCIVersion + 1 // make sure the cloud init config gets executed
+			}
+
+			if curCIVersion < newCIVersion {
+				log.Notice("New cloud init config detected - applying")
+
+				// write meta-data file
+				versionString := fmt.Sprintf("instance-id: %s/%s\n", config.UUIDandVersion.UUID.String(), getCloudInitVersion(config))
+				err = fileutils.WriteRename(metadataPath, []byte(versionString))
+				if err != nil {
+					err := fmt.Errorf("doActivate: Failed to write cloud-init metadata file. Error %s", err)
+					log.Error(err.Error())
+					status.SetErrorNow(err.Error())
+					return
+				}
+
+				// apply cloud init config
+				for _, writableFile := range status.WritableFiles {
+					err := cloudconfig.WriteFile(log, writableFile, rootPath)
+					if err != nil {
+						err := fmt.Errorf("doActivate: Failed to apply cloud-init config. Error %s", err)
+						log.Error(err.Error())
+						status.SetErrorNow(err.Error())
+						return
+					}
+				}
 			}
 		default:
 			// assume everything else to be disk formats
@@ -1714,8 +1800,10 @@ func doInactivate(ctx *domainContext, status *types.DomainStatus, impatient bool
 			status.DomainId = 0
 		}
 	}
+	doCleanup(ctx, status)
+}
 
-	// Cleanup
+func doCleanup(ctx *domainContext, status *types.DomainStatus) {
 	if err := hyper.Task(status).Cleanup(status.DomainName); err != nil {
 		log.Errorf("failed to cleanup domain: %s (%v)", status.DomainName, err)
 	}
@@ -1742,6 +1830,7 @@ func doInactivate(ctx *domainContext, status *types.DomainStatus, impatient bool
 			log.Errorln("unmountContainers failed after retry with force flag")
 		}
 	}
+
 	if ctx.cpuPinningSupported {
 		if status.VmConfig.CPUsPinned {
 			if err := ctx.cpuAllocator.Free(status.UUIDandVersion.UUID); err != nil {
@@ -1756,7 +1845,7 @@ func doInactivate(ctx *domainContext, status *types.DomainStatus, impatient bool
 	status.IoAdapterList = nil
 	publishDomainStatus(ctx, status)
 
-	log.Functionf("doInactivate(%v) done for %s",
+	log.Functionf("doClennup(%v) done for %s",
 		status.UUIDandVersion, status.DisplayName)
 }
 
@@ -1875,20 +1964,38 @@ func configToStatus(ctx *domainContext, config types.DomainConfig,
 	//clean environment variables
 	status.EnvVariables = nil
 
+	// Fetch cloud-init userdata
 	if config.IsCipher || config.CloudInitUserData != nil {
 		ciStr, err := fetchCloudInit(ctx, config)
 		if err != nil {
 			return fmt.Errorf("failed to fetch cloud-init userdata: %s",
 				err)
 		}
-		if status.OCIConfigDir != "" {
-			envList, err := parseEnvVariablesFromCloudInit(ciStr)
-			if err != nil {
-				return fmt.Errorf("failed to parse environment variable from cloud-init userdata: %s",
-					err)
+		if status.OCIConfigDir != "" { // If AppInstance is a container, we need to parse cloud-init config and apply the supported parts
+			if cloudconfig.IsCloudConfig(ciStr) { // treat like the cloud-init config
+				cc, err := cloudconfig.ParseCloudConfig(ciStr)
+				if err != nil {
+					return fmt.Errorf("failed to unmarshal cloud-init userdata: %s",
+						err)
+				}
+				status.WritableFiles = cc.WriteFiles
+
+				envList, err := parseEnvVariablesFromCloudInit(cc.RunCmd)
+				if err != nil {
+					return fmt.Errorf("failed to parse environment variable from cloud-init userdata: %s",
+						err)
+				}
+				status.EnvVariables = envList
+			} else { // treat like the key value map for envs (old syntax)
+				envPairs := strings.Split(ciStr, "\n")
+				envList, err := parseEnvVariablesFromCloudInit(envPairs)
+				if err != nil {
+					return fmt.Errorf("failed to parse environment variable from cloud-init env map: %s",
+						err)
+				}
+				status.EnvVariables = envList
 			}
-			status.EnvVariables = envList
-		} else {
+		} else { // If AppInstance is a VM, we need to create a cloud-init ISO
 			switch config.MetaDataType {
 			case types.MetaDataDrive, types.MetaDataDriveMultipart:
 				ds, err := createCloudInitISO(ctx, config, ciStr)
@@ -2212,6 +2319,8 @@ func handleDelete(ctx *domainContext, key string, status *types.DomainStatus) {
 
 	if status.Activated {
 		doInactivate(ctx, status, true)
+	} else if status.HasError() {
+		doCleanup(ctx, status)
 	}
 
 	// Check if the USB controller became available for dom0
@@ -2497,13 +2606,12 @@ func fetchCloudInit(ctx *domainContext,
 // Parse the list of environment variables from the cloud init
 // We are expecting the environment variables to be pass in particular format in cloud-int
 // Example:
-// Key1:Val1
-// Key2:Val2 ...
-func parseEnvVariablesFromCloudInit(ciStr string) (map[string]string, error) {
+// Key1=Val1
+// Key2=Val2 ...
+func parseEnvVariablesFromCloudInit(envPairs []string) (map[string]string, error) {
 
 	envList := make(map[string]string, 0)
-	list := strings.Split(ciStr, "\n")
-	for _, v := range list {
+	for _, v := range envPairs {
 		pair := strings.SplitN(v, "=", 2)
 		if len(pair) != 2 {
 			errStr := fmt.Sprintf("Variable \"%s\" not defined properly\nKey value pair should be delimited by \"=\"", pair[0])
@@ -2642,7 +2750,7 @@ func mkisofs(output string, dir string) error {
 		dir,
 	}
 	log.Functionf("Calling command %s %v\n", cmd, args)
-	stdoutStderr, err := base.Exec(log, cmd, args...).CombinedOutput()
+	stdoutStderr, err := base.Exec(log, cmd, args...).WithUnlimitedTimeout(15 * time.Minute).CombinedOutput()
 	if err != nil {
 		errStr := fmt.Sprintf("mkisofs failed: %s",
 			string(stdoutStderr))
@@ -2912,6 +3020,10 @@ func updatePortAndPciBackIoBundle(ctx *domainContext, ib *types.IoBundle) (chang
 		ib.Type, ib.Phylabel, ib.AssignmentGroup, isPort, keepInHost, len(list))
 	anyChanged := false
 	for _, ib := range list {
+		if ib.UsbAddr != "" {
+			// this is usb device forwarding, so usbmanager cares for not passing through network devices
+			continue
+		}
 		changed, err := updatePortAndPciBackIoMember(ctx, ib, isPort, keepInHost)
 		anyChanged = anyChanged || changed
 		if err != nil {
@@ -2984,7 +3096,7 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 		ib.IsPCIBack = false
 		// Verify that it has been returned from pciback
 		_, err = types.IoBundleToPci(log, ib)
-		if err != nil {
+		if err != nil || ib.UsbAddr != "" {
 			err = fmt.Errorf("adapter %s (group %s type %d) PCI ID %s not found: %v",
 				ib.Phylabel, ib.AssignmentGroup, ib.Type,
 				ib.PciLong, err)
@@ -2999,7 +3111,7 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 		} else if ctx.deviceNetworkStatus.Testing && ib.Type.IsNet() {
 			log.Noticef("Not assigning %s (%s) to pciback due to Testing",
 				ib.Phylabel, ib.PciLong)
-		} else if ib.PciLong != "" {
+		} else if ib.PciLong != "" && ib.UsbAddr == "" {
 			log.Noticef("Assigning %s (%s) to pciback",
 				ib.Phylabel, ib.PciLong)
 			err := hyper.PCIReserve(ib.PciLong)

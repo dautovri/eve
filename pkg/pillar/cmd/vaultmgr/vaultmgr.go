@@ -30,7 +30,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/lf-edge/eve/api/go/attest"
+	"github.com/lf-edge/eve-api/go/attest"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -260,18 +260,27 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	// initialize publishing handles
 	initializeSelfPublishHandles(ps, &ctx)
-	if etpm.IsTpmEnabled() {
+	tpmEnabled := etpm.IsTpmEnabled()
+	if tpmEnabled {
 		// TPM is enabled. Check if defaultVault directory exists, if not set vaultconfig
 		tpmKeyOnlyMode := checkAndPublishVaultConfig(&ctx)
 		handler.SetHandlerOptions(vault.HandlerOptions{TpmKeyOnlyMode: tpmKeyOnlyMode})
 	}
+
+	if tpmEnabled {
+		log.Noticef("about to setup the vault and fetch the disk key from TPM")
+	} else {
+		log.Noticef("about to setup the vault without TPM")
+	}
+	// if TPM available, this sets up the fscrypt and eventually calls FetchSealedVaultKey
 	if err := handler.SetupDefaultVault(); err != nil {
-		log.Errorf("setupDefaultVault failed, err: %v", err)
+		log.Errorf("SetupDefaultVault failed, err: %v", err)
 		getAndPublishAllVaultStatuses(&ctx)
 	} else {
+		log.Noticef("vault is setup and unlocked successfully")
 		ctx.defaultVaultUnlocked = true
 	}
-	if ctx.defaultVaultUnlocked || !etpm.IsTpmEnabled() {
+	if ctx.defaultVaultUnlocked || !tpmEnabled {
 		// Now that vault is unlocked, run any upgrade converter handler if needed
 		// In case of non-TPM platforms, we do this irrespective of
 		// defaultVaultUnlocked
@@ -409,7 +418,7 @@ func handleVaultKeyFromControllerImpl(ctxArg interface{}, key string,
 		}
 		// Try unlocking the vault now, in case it is not yet unlocked
 		log.Noticef("Vault is still locked, trying to unlock")
-		err = etpm.SealDiskKey(decryptedKey, etpm.DiskKeySealingPCRs)
+		err = etpm.SealDiskKey(log, decryptedKey, etpm.DiskKeySealingPCRs)
 		if err != nil {
 			log.Errorf("Failed to Seal key in TPM %v", err)
 			return
@@ -447,7 +456,7 @@ func handleVaultKeyFromControllerImpl(ctxArg interface{}, key string,
 		}
 		log.Warnln("default vault removed")
 		if err := handler.SetupDefaultVault(); err != nil {
-			log.Errorf("setupDefaultVault failed, err: %v", err)
+			log.Errorf("SetupDefaultVault failed, err: %v", err)
 			getAndPublishAllVaultStatuses(ctx)
 			return
 		}
@@ -485,12 +494,12 @@ func publishVaultKey(ctx *vaultMgrContext, vaultName string) error {
 		}
 		keyBytes, err := etpm.FetchSealedVaultKey(log)
 		if err != nil {
-			return fmt.Errorf("Failed to retrieve key from TPM %v", err)
+			return fmt.Errorf("Failed to retrieve key from TPM %w", err)
 		}
 
 		encryptedKey, err := etpm.EncryptDecryptUsingTpm(keyBytes, true)
 		if err != nil {
-			return fmt.Errorf("Failed to encrypt vault key %v", err)
+			return fmt.Errorf("Failed to encrypt vault key %w", err)
 		}
 
 		hash := sha256.New()
@@ -503,7 +512,7 @@ func publishVaultKey(ctx *vaultMgrContext, vaultName string) error {
 		}
 		encryptedVaultKey, err = proto.Marshal(keyData)
 		if err != nil {
-			return fmt.Errorf("Failed to Marshal keyData %v", err)
+			return fmt.Errorf("Failed to Marshal keyData %w", err)
 		}
 	}
 

@@ -1,6 +1,6 @@
 ---
 name: PR build
-on:
+on:  # yamllint disable-line rule:truthy
   pull_request:
     branches:
       - "master"
@@ -18,12 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: arm64-dirty
-          arch: arm64
-        - os: ubuntu-20.04
-          arch: amd64
-        - os: ubuntu-20.04
-          arch: riscv64
+          - os: buildjet-4vcpu-ubuntu-2204-arm
+            arch: arm64
+          - os: ubuntu-20.04
+            arch: amd64
+          - os: ubuntu-20.04
+            arch: riscv64
     steps:
       - name: Starting Report
         run: |
@@ -42,7 +42,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: ensure zstd for cache  # this should be removed once the arm64 VM includes zstd
-        if: ${{ matrix.os == 'arm64-dirty' || matrix.os == 'arm64-secure' }}
+        if: ${{ matrix.os == 'buildjet-4vcpu-ubuntu-2204-arm' || matrix.os == 'arm64-secure' }}
         run: |
           sudo apt install -y zstd
       - name: ensure packages for cross-arch build

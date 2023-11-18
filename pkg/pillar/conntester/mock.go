@@ -10,13 +10,15 @@ import (
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/netdump"
+	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 )
 
 // MockConnectivityTester is used for unit testing.
 type MockConnectivityTester struct {
 	sync.Mutex
-	TestDuration time.Duration // inject
+	TestDuration   time.Duration             // inject
+	NetworkMonitor netmonitor.NetworkMonitor // inject
 
 	iteration  int
 	connErrors map[ifRef]error
@@ -71,19 +73,18 @@ func (t *MockConnectivityTester) TestConnectivity(dns types.DeviceNetworkStatus,
 			// We have enough uplinks with cloud connectivity working.
 			break
 		}
-		port := dns.GetPortByIfName(ifName)
-		missingErr := fmt.Sprintf("port %s does not exist - ignored", ifName)
-		if port == nil || port.LastError == missingErr {
-			err := fmt.Errorf("interface %s is missing", ifName)
+		if _, exists, _ := t.NetworkMonitor.GetInterfaceIndex(ifName); !exists {
+			err = fmt.Errorf("interface %s is missing", ifName)
 			errorList = append(errorList, err)
 			intfStatusMap.RecordFailure(ifName, err.Error())
 			continue
 		}
+		port := dns.GetPortByIfName(ifName)
 		if !port.IsMgmt {
 			continue
 		}
 		if len(port.AddrInfoList) == 0 {
-			err := &types.IPAddrNotAvail{IfName: ifName}
+			err := &types.IPAddrNotAvailError{IfName: ifName}
 			errorList = append(errorList, err)
 			intfStatusMap.RecordFailure(ifName, err.Error())
 			continue
@@ -96,10 +97,10 @@ func (t *MockConnectivityTester) TestConnectivity(dns types.DeviceNetworkStatus,
 		} else {
 			nonRtfErrs = true
 		}
-		if _, noDNSErr := err.(*types.DNSNotAvail); noDNSErr {
+		if _, noDNSErr := err.(*types.DNSNotAvailError); noDNSErr {
 			portsNotReady = append(portsNotReady, port.Logicallabel)
 		}
-		if _, noIPErr := err.(*types.IPAddrNotAvail); noIPErr {
+		if _, noIPErr := err.(*types.IPAddrNotAvailError); noIPErr {
 			portsNotReady = append(portsNotReady, port.Logicallabel)
 		}
 		if err != nil {

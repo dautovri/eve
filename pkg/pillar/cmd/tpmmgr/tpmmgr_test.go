@@ -10,7 +10,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
-	"reflect"
 	"testing"
 	"time"
 
@@ -199,26 +198,5 @@ func TestVerifyEdgeNodeCerts(t *testing.T) {
 	if err := verifyCert(attestCertPem, deviceCertPem); err != nil {
 		t.Errorf("Attestation cert verification failed with err: %v", err)
 		return
-	}
-}
-
-func TestSealUnseal(t *testing.T) {
-	_, err := os.Stat(etpm.TpmDevicePath)
-	if err != nil {
-		t.Skip("TPM is not available, skipping the test.")
-	}
-
-	dataToSeal := []byte("secret")
-	if err := etpm.SealDiskKey(dataToSeal, etpm.DiskKeySealingPCRs); err != nil {
-		t.Errorf("Seal operation failed with err: %v", err)
-		return
-	}
-	unsealedData, err := etpm.UnsealDiskKey(etpm.DiskKeySealingPCRs)
-	if err != nil {
-		t.Errorf("Unseal operation failed with err: %v", err)
-		return
-	}
-	if !reflect.DeepEqual(dataToSeal, unsealedData) {
-		t.Errorf("Seal/Unseal operation failed, want %v, but got %v", dataToSeal, unsealedData)
 	}
 }

@@ -64,14 +64,8 @@ Image verification is validation of each component's actual sha256 hash matches 
 
 ### Prepare Networking
 
-[zedmanager#doPrepare()](../pkg/pillar/cmd/zedmanager/updatestatus.go#L696) coordinates the preparation of networking. It first sets up LISP EIDs, if needed, then creates any networking.
+[zedmanager#doPrepare()](../pkg/pillar/cmd/zedmanager/updatestatus.go#L696) coordinates the preparation of networking.
 
-1. Set up LISP
-   1. [zedmanager](../pkg/pillar/cmd/zedmanager/): create and publish an [EIDConfig](../pkg/pillar/types/eidtypes.go#L26)
-   1. [identitymanager](../pkg/pillar/cmd/identitymanager/): see the [EIDConfig](../pkg/pillar/types/eidtypes.go#L26)
-   1. [identitymanager](../pkg/pillar/cmd/identitymanager/): if needed, create the LISP EIDs and register them
-   1. [identitymanager](../pkg/pillar/cmd/identitymanager/): create and publish an [EIDStatus](../pkg/pillar/types/eidtypes.go#L60) marking as complete
-   1. [zedmanager](../pkg/pillar/cmd/zedmanager/): retrieve the [EIDStatus](../pkg/pillar/types/eidtypes.go#L60), LISP EID stage complete
 1. Set up networking
    1. [zedmanager](../pkg/pillar/cmd/zedmanager/): create and publish an [AppNetworkConfig](../pkg/pillar/types/zedrouter.types#L25)
    1. [zedrouter](../pkg/pillar/cmd/zedrouter/): see the [AppNetworkConfig](../pkg/pillar/types/zedrouter.types#L25)
@@ -101,13 +95,11 @@ The list of subscriptions relevant to ECO initialization is as follows.
 | `zedagent` | `AppInstanceConfig` | `zedmanager` |
 | `zedmanager` | `DownloaderConfig` | `downloader` |
 |    | `VerifyImageConfig` | `verifier` |
-|    | `EIDConfig` | `identitymanager` |
 |    | `AppNetworkConfig` | `zedrouter` |
 |    | `DomainConfig` | `domainmgr` |
 |    | `AppInstanceStatus` | multiple |
 | `downloader` | `DownloaderStatus` | `zedmanager` |
 | `verifier` | `VerifyImageStatus` | `zedmanager` |
-| `identitymanager` | `EIDStatus` | `zedmanager` |
 | `zedrouter` | `AppNetworkStatus` | `zedmanager` |
 | `domainmgr` | `DomainStatus` | `zedmanager` |
 
@@ -148,6 +140,6 @@ to download, given the credentials and information necessary. This method should
 accept, as a parameter, the local path where it should deposit the artifact, and
 return an `error`.
 1. Add an entry for the type to the various `DsType*` constants and variables
-in the api protobufs under [storage.proto](../api/proto/config/storage.proto) and
+in the api protobufs under [storage.proto](https://github.com/lf-edge/eve-api/tree/main/proto/proto/config/storage.proto) and
 regenerate all of the API language imports.
 1. Add a `case` statement for your new download protocol to the [switch dsCtx.TransportMethod](../pkg/pillar/cmd/downloader/downloader.go#L1712).

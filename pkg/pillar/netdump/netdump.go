@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lf-edge/eve/libs/nettrace"
+	"github.com/lf-edge/eve-libs/nettrace"
 )
 
 const (
@@ -100,15 +100,15 @@ var eveFilesToDump = [...]fileToDump{
 		dstPath: "eve/aa.json",
 	},
 	{
-		srcPath: "/run/wwan/config.json",
+		srcPath: "/run/nim/WwanConfig/global.json",
 		dstPath: "eve/wwan-config.json",
 	},
 	{
-		srcPath: "/run/wwan/status.json",
+		srcPath: "/run/wwan/WwanStatus/global.json",
 		dstPath: "eve/wwan-status.json",
 	},
 	{
-		srcPath: "/run/wwan/metrics.json",
+		srcPath: "/run/wwan/WwanMetrics/global.json",
 		dstPath: "eve/wwan-metrics.json",
 	},
 }
@@ -330,7 +330,7 @@ func (dumper *NetDumper) Publish(topic string,
 			}
 			pcapName += ".pcap"
 			buf := new(strings.Builder)
-			err = pcap.WriteTo(buf)
+			_, err = pcap.WriteTo(buf)
 			if err != nil {
 				return "", fmt.Errorf("netdump: failed to write PCAP %s: %w", pcapName, err)
 			}

@@ -13,56 +13,56 @@ import (
 )
 
 func (z *zedrouter) doNetworkInstanceSanityCheck(
-	status *types.NetworkInstanceStatus) error {
+	config *types.NetworkInstanceConfig) (niConflict bool, err error) {
 	z.log.Functionf("Sanity Checking NetworkInstance(%s-%s): type:%d, IpType:%d",
-		status.DisplayName, status.UUID, status.Type, status.IpType)
+		config.DisplayName, config.UUID, config.Type, config.IpType)
 
 	//  Check NetworkInstanceType
-	switch status.Type {
+	switch config.Type {
 	case types.NetworkInstanceTypeLocal:
 		// Do nothing
 	case types.NetworkInstanceTypeSwitch:
 		// Do nothing
 	default:
-		return fmt.Errorf("network instance type %d is not supported", status.Type)
+		return false, fmt.Errorf("network instance type %d is not supported", config.Type)
 	}
 
 	// IpType - Check for valid types
-	switch status.IpType {
+	switch config.IpType {
 	case types.AddressTypeNone:
 		// Do nothing
 	case types.AddressTypeIPV4, types.AddressTypeIPV6,
 		types.AddressTypeCryptoIPV4, types.AddressTypeCryptoIPV6:
-		err := z.doNetworkInstanceSubnetSanityCheck(status)
+		niConflict, err = z.doNetworkInstanceSubnetSanityCheck(config)
 		if err != nil {
-			return err
+			return niConflict, err
 		}
-		err = z.doNetworkInstanceDhcpRangeSanityCheck(status)
+		err = z.doNetworkInstanceDhcpRangeSanityCheck(config)
 		if err != nil {
-			return err
+			return false, err
 		}
-		err = z.doNetworkInstanceGatewaySanityCheck(status)
+		err = z.doNetworkInstanceGatewaySanityCheck(config)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 	default:
-		return fmt.Errorf("IpType %d not supported", status.IpType)
+		return false, fmt.Errorf("IpType %d not supported", config.IpType)
 	}
-	return nil
+	return false, nil
 }
 
 func (z *zedrouter) doNetworkInstanceSubnetSanityCheck(
-	status *types.NetworkInstanceStatus) error {
-	if status.Subnet.IP == nil || status.Subnet.IP.IsUnspecified() {
-		return fmt.Errorf("subnet unspecified for %s-%s: %+v",
-			status.Key(), status.DisplayName, status.Subnet)
+	config *types.NetworkInstanceConfig) (niConflict bool, err error) {
+	if config.Subnet.IP == nil || config.Subnet.IP.IsUnspecified() {
+		return false, fmt.Errorf("subnet unspecified for %s-%s: %+v",
+			config.Key(), config.DisplayName, config.Subnet)
 	}
 
-	items := z.pubNetworkInstanceStatus.GetAll()
-	for key2, status2 := range items {
-		niStatus2 := status2.(types.NetworkInstanceStatus)
-		if status.Key() == key2 {
+	items := z.subNetworkInstanceConfig.GetAll()
+	for key2, config2 := range items {
+		niConfig2 := config2.(types.NetworkInstanceConfig)
+		if config.Key() == key2 {
 			continue
 		}
 
@@ -71,62 +71,62 @@ func (z *zedrouter) doNetworkInstanceSubnetSanityCheck(
 		// any other NI and vice-versa ( Other NI Subnet addrs are not
 		// contained in the current NI subnet)
 
-		// Check if status.Subnet is contained in iterStatusEntry.Subnet
-		if niStatus2.Subnet.Contains(status.Subnet.IP) {
-			return fmt.Errorf("subnet(%s, IP:%s) overlaps with another "+
+		// Check if config.Subnet is contained in iterStatusEntry.Subnet
+		if niConfig2.Subnet.Contains(config.Subnet.IP) {
+			return true, fmt.Errorf("subnet(%s, IP:%s) overlaps with another "+
 				"network instance(%s-%s) Subnet(%s)",
-				status.Subnet.String(), status.Subnet.IP.String(),
-				niStatus2.DisplayName, niStatus2.UUID,
-				niStatus2.Subnet.String())
+				config.Subnet.String(), config.Subnet.IP.String(),
+				niConfig2.DisplayName, niConfig2.UUID,
+				niConfig2.Subnet.String())
 		}
 
-		// Reverse check: check if iterStatusEntry.Subnet is contained in status.subnet
-		if status.Subnet.Contains(niStatus2.Subnet.IP) {
-			return fmt.Errorf("another network instance(%s-%s) Subnet(%s) "+
+		// Reverse check: check if iterStatusEntry.Subnet is contained in config.subnet
+		if config.Subnet.Contains(niConfig2.Subnet.IP) {
+			return true, fmt.Errorf("another network instance(%s-%s) Subnet(%s) "+
 				"overlaps with Subnet(%s)",
-				niStatus2.DisplayName, niStatus2.UUID,
-				niStatus2.Subnet.String(),
-				status.Subnet.String())
+				niConfig2.DisplayName, niConfig2.UUID,
+				niConfig2.Subnet.String(),
+				config.Subnet.String())
 		}
 	}
-	return nil
+	return false, nil
 }
 
 func (z *zedrouter) doNetworkInstanceDhcpRangeSanityCheck(
-	status *types.NetworkInstanceStatus) error {
-	if status.DhcpRange.Start == nil || status.DhcpRange.Start.IsUnspecified() {
+	config *types.NetworkInstanceConfig) error {
+	if config.DhcpRange.Start == nil || config.DhcpRange.Start.IsUnspecified() {
 		return fmt.Errorf("DhcpRange Start Unspecified: %+v",
-			status.DhcpRange.Start)
+			config.DhcpRange.Start)
 	}
-	if !status.Subnet.Contains(status.DhcpRange.Start) {
+	if !config.Subnet.Contains(config.DhcpRange.Start) {
 		return fmt.Errorf("DhcpRange Start(%s) not within Subnet(%s)",
-			status.DhcpRange.Start.String(), status.Subnet.String())
+			config.DhcpRange.Start.String(), config.Subnet.String())
 	}
-	if status.DhcpRange.End == nil || status.DhcpRange.End.IsUnspecified() {
+	if config.DhcpRange.End == nil || config.DhcpRange.End.IsUnspecified() {
 		return fmt.Errorf("DhcpRange End Unspecified: %+v",
-			status.DhcpRange.Start)
+			config.DhcpRange.Start)
 	}
-	if !status.Subnet.Contains(status.DhcpRange.End) {
+	if !config.Subnet.Contains(config.DhcpRange.End) {
 		return fmt.Errorf("DhcpRange End(%s) not within Subnet(%s)",
-			status.DhcpRange.End.String(), status.Subnet.String())
+			config.DhcpRange.End.String(), config.Subnet.String())
 	}
 	return nil
 }
 
 func (z *zedrouter) doNetworkInstanceGatewaySanityCheck(
-	status *types.NetworkInstanceStatus) error {
-	if status.Gateway == nil || status.Gateway.IsUnspecified() {
+	config *types.NetworkInstanceConfig) error {
+	if config.Gateway == nil || config.Gateway.IsUnspecified() {
 		return fmt.Errorf("gateway is not specified: %+v",
-			status.Gateway)
+			config.Gateway)
 	}
-	if !status.Subnet.Contains(status.Gateway) {
+	if !config.Subnet.Contains(config.Gateway) {
 		return fmt.Errorf("gateway(%s) not within Subnet(%s)",
-			status.Gateway.String(), status.Subnet.String())
+			config.Gateway.String(), config.Subnet.String())
 	}
-	if status.DhcpRange.Contains(status.Gateway) {
+	if config.DhcpRange.Contains(config.Gateway) {
 		return fmt.Errorf("gateway(%s) is in DHCP Range(%v,%v)",
-			status.Gateway, status.DhcpRange.Start,
-			status.DhcpRange.End)
+			config.Gateway, config.DhcpRange.Start,
+			config.DhcpRange.End)
 	}
 	return nil
 }
@@ -135,19 +135,19 @@ func (z *zedrouter) validateAppNetworkConfig(appNetConfig types.AppNetworkConfig
 	z.log.Functionf("AppNetwork(%s), check for duplicate port map acls",
 		appNetConfig.DisplayName)
 	// For App Networks, check for common port map rules
-	ulCfgList1 := appNetConfig.UnderlayNetworkList
-	if len(ulCfgList1) == 0 {
+	adapterCfgList1 := appNetConfig.AppNetAdapterList
+	if len(adapterCfgList1) == 0 {
 		return nil
 	}
-	if z.containsHangingACLPortMapRule(ulCfgList1) {
+	if z.containsHangingACLPortMapRule(adapterCfgList1) {
 		return fmt.Errorf("network with no uplink, has portmap")
 	}
 	sub := z.subAppNetworkConfig
 	items := sub.GetAll()
 	for _, c := range items {
 		appNetConfig2 := c.(types.AppNetworkConfig)
-		ulCfgList2 := appNetConfig2.UnderlayNetworkList
-		if len(ulCfgList2) == 0 {
+		adapterCfgList2 := appNetConfig2.AppNetAdapterList
+		if len(adapterCfgList2) == 0 {
 			continue
 		}
 		if appNetConfig.DisplayName == appNetConfig2.DisplayName {
@@ -160,7 +160,7 @@ func (z *zedrouter) validateAppNetworkConfig(appNetConfig types.AppNetworkConfig
 		if appNetStatus2.HasError() || !appNetStatus2.Activated {
 			continue
 		}
-		if z.checkForPortMapOverlap(ulCfgList1, ulCfgList2) {
+		if z.checkForPortMapOverlap(adapterCfgList1, adapterCfgList2) {
 			return fmt.Errorf("app %s and %s have duplicate portmaps",
 				appNetConfig.DisplayName, appNetStatus2.DisplayName)
 		}
@@ -176,8 +176,8 @@ func (z *zedrouter) validateAppNetworkConfigForModify(
 	// some hotplug event.
 	// But deletion is hard.
 	// For now don't allow any adds or deletes.
-	if len(newConfig.UnderlayNetworkList) != len(oldConfig.UnderlayNetworkList) {
-		return fmt.Errorf("changing number of underlays (for %s) is unsupported",
+	if len(newConfig.AppNetAdapterList) != len(oldConfig.AppNetAdapterList) {
+		return fmt.Errorf("changing number of AppNetAdapters (for %s) is unsupported",
 			newConfig.UUIDandVersion)
 	}
 	return z.validateAppNetworkConfig(newConfig)
@@ -185,15 +185,15 @@ func (z *zedrouter) validateAppNetworkConfigForModify(
 
 func (z *zedrouter) checkNetworkReferencesFromApp(config types.AppNetworkConfig) (
 	netInErrState bool, err error) {
-	// Check networks for Underlay
+	// Check AppNetAdapters for the existence of the network instances
 	// XXX - Should we also check for Network(instance)Status objects here itself?
-	for _, ulConfig := range config.UnderlayNetworkList {
-		netInstStatus := z.lookupNetworkInstanceStatus(ulConfig.Network.String())
+	for _, adapterConfig := range config.AppNetAdapterList {
+		netInstStatus := z.lookupNetworkInstanceStatus(adapterConfig.Network.String())
 		if netInstStatus == nil {
-			err := fmt.Errorf("missing underlay network %s for app %s/%s",
-				ulConfig.Network.String(), config.UUIDandVersion, config.DisplayName)
+			err := fmt.Errorf("missing network instance %s for app %s/%s",
+				adapterConfig.Network.String(), config.UUIDandVersion, config.DisplayName)
 			z.log.Error(err)
-			// App network configuration that has underlays pointing to non-existent
+			// App network configuration that has AppNetAdapters pointing to non-existent
 			// network instances is invalid. Such configuration should never come to
 			// device from cloud.
 			// But, on the device sometimes, zedrouter sees the app network configuration
@@ -206,15 +206,15 @@ func (z *zedrouter) checkNetworkReferencesFromApp(config types.AppNetworkConfig)
 			return false, err
 		}
 		if !netInstStatus.Activated {
-			err := fmt.Errorf("underlay network %s needed by app %s/%s is not activated",
-				ulConfig.Network.String(), config.UUIDandVersion, config.DisplayName)
+			err := fmt.Errorf("network instance %s needed by app %s/%s is not activated",
+				adapterConfig.Network.String(), config.UUIDandVersion, config.DisplayName)
 			z.log.Error(err)
 			return false, err
 		}
 		if netInstStatus.HasError() {
 			err := fmt.Errorf(
-				"underlay network %s needed by app %s/%s is in error state: %s",
-				ulConfig.Network.String(), config.UUIDandVersion, config.DisplayName,
+				"network instance %s needed by app %s/%s is in error state: %s",
+				adapterConfig.Network.String(), config.UUIDandVersion, config.DisplayName,
 				netInstStatus.Error)
 			z.log.Error(err)
 			return true, err
@@ -225,14 +225,14 @@ func (z *zedrouter) checkNetworkReferencesFromApp(config types.AppNetworkConfig)
 
 // Check if there is a portmap rule for a network instance with no uplink interface.
 func (z *zedrouter) containsHangingACLPortMapRule(
-	ulCfgList []types.UnderlayNetworkConfig) bool {
-	for _, ulCfg := range ulCfgList {
-		network := ulCfg.Network.String()
+	adapterCfgList []types.AppNetAdapterConfig) bool {
+	for _, adapterCfg := range adapterCfgList {
+		network := adapterCfg.Network.String()
 		netInstStatus := z.lookupNetworkInstanceStatus(network)
 		if netInstStatus == nil || netInstStatus.PortLogicalLabel != "" {
 			continue
 		}
-		for _, ace := range ulCfg.ACLs {
+		for _, ace := range adapterCfg.ACLs {
 			for _, action := range ace.Actions {
 				if action.PortMap {
 					return true
@@ -243,18 +243,18 @@ func (z *zedrouter) containsHangingACLPortMapRule(
 	return false
 }
 
-func (z *zedrouter) checkForPortMapOverlap(ulCfgList1 []types.UnderlayNetworkConfig,
-	ulCfgList2 []types.UnderlayNetworkConfig) bool {
-	for _, ulCfg1 := range ulCfgList1 {
-		network1 := ulCfg1.Network
+func (z *zedrouter) checkForPortMapOverlap(adapterCfgList1 []types.AppNetAdapterConfig,
+	adapterCfgList2 []types.AppNetAdapterConfig) bool {
+	for _, adapterCfg1 := range adapterCfgList1 {
+		network1 := adapterCfg1.Network
 		// Validate whether there are duplicate portmap rules within itself.
-		if z.detectPortMapConflictWithinUL(ulCfg1.ACLs) {
+		if z.detectPortMapConflictWithinAdapter(adapterCfg1.ACLs) {
 			return true
 		}
-		for _, ulCfg2 := range ulCfgList2 {
-			network2 := ulCfg2.Network
+		for _, adapterCfg2 := range adapterCfgList2 {
+			network2 := adapterCfg2.Network
 			if network1 == network2 || z.checkUplinkPortOverlap(network1, network2) {
-				if z.detectPortMapConflictAcrossULs(ulCfg1.ACLs, ulCfg2.ACLs) {
+				if z.detectPortMapConflictAcrossAdapters(adapterCfg1.ACLs, adapterCfg2.ACLs) {
 					return true
 				}
 			}
@@ -296,7 +296,7 @@ func appendError(allErrors string, prefix string, lasterr string) (
 	return fmt.Sprintf("%s%s: %s\n\n", allErrors, prefix, lasterr), true
 }
 
-func (z *zedrouter) detectPortMapConflictWithinUL(ACLs []types.ACE) bool {
+func (z *zedrouter) detectPortMapConflictWithinAdapter(ACLs []types.ACE) bool {
 	matchTypes1 := []string{"protocol"}
 	matchTypes2 := []string{"protocol", "lport"}
 	idx1 := 0
@@ -338,7 +338,7 @@ func (z *zedrouter) detectPortMapConflictWithinUL(ACLs []types.ACE) bool {
 
 // Check for duplicate portmap rules in between two set of ACLs.
 // For this, we will match the protocol/lport being same.
-func (z *zedrouter) detectPortMapConflictAcrossULs(
+func (z *zedrouter) detectPortMapConflictAcrossAdapters(
 	ACLs []types.ACE, ACLs1 []types.ACE) bool {
 	matchTypes := []string{"protocol", "lport"}
 	for _, ace1 := range ACLs {

@@ -49,6 +49,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/uplinkprober"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
+	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/sirupsen/logrus"
 )
@@ -163,6 +164,24 @@ type zedrouter struct {
 
 	// Retry NI or app network config that zedrouter failed to apply
 	retryTimer *time.Timer
+
+	// Subscriptions to gather information about
+	// patch envelopes from volumemgr and zedagent
+	// external envelopes have to be downloaded via
+	// volumemgr, therefore we need to be subscribed
+	// to volume status to know filepath and download status
+	// patchEnvelopeInfo is list of patchEnvelopes which
+	// is coming from EdgeDevConfig containing information
+	// about inline patch envelopes and volume uuid as reference
+	// for external patch envelopes
+	subPatchEnvelopeInfo pubsub.Subscription
+	subVolumeStatus      pubsub.Subscription
+	subContentTreeStatus pubsub.Subscription
+
+	patchEnvelopes      *PatchEnvelopes
+	patchEnvelopesUsage *generics.LockedMap[string, types.PatchEnvelopeUsage]
+
+	pubPatchEnvelopesUsage pubsub.Publication
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -175,6 +194,8 @@ func Run(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject, args []s
 		pubSub: ps,
 		logger: logger,
 		log:    log,
+
+		patchEnvelopesUsage: generics.NewLockedMap[string, types.PatchEnvelopeUsage](),
 	}
 	agentbase.Init(&zedrouter, logger, log, agentName,
 		agentbase.WithArguments(args))
@@ -202,6 +223,8 @@ func (z *zedrouter) init() (err error) {
 	z.zedcloudMetrics = zedcloud.NewAgentMetrics()
 	z.cipherMetrics = cipher.NewAgentMetrics(agentName)
 
+	z.patchEnvelopes = NewPatchEnvelopes(z.log, z.pubSub)
+
 	gcp := *types.DefaultConfigItemValueMap()
 	z.appContainerStatsInterval = gcp.GlobalValueInt(types.AppContainerStatsInterval)
 
@@ -223,8 +246,8 @@ func (z *zedrouter) init() (err error) {
 	z.decryptCipherContext.Log = z.log
 	z.decryptCipherContext.AgentName = agentName
 	z.decryptCipherContext.AgentMetrics = z.cipherMetrics
-	z.decryptCipherContext.SubControllerCert = z.subControllerCert
-	z.decryptCipherContext.SubEdgeNodeCert = z.subEdgeNodeCert
+	z.decryptCipherContext.PubSubControllerCert = z.subControllerCert
+	z.decryptCipherContext.PubSubEdgeNodeCert = z.subEdgeNodeCert
 
 	// Initialize Zedrouter components (for Linux network stack).
 	z.networkMonitor = &netmonitor.LinuxNetworkMonitor{Log: z.log}
@@ -305,6 +328,9 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 		z.subWwanStatus,
 		z.subWwanMetrics,
 		z.subDomainStatus,
+		z.subPatchEnvelopeInfo,
+		z.subVolumeStatus,
+		z.subContentTreeStatus,
 	}
 	for _, sub := range inactiveSubs {
 		if err = sub.Activate(); err != nil {
@@ -356,6 +382,15 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 		case change := <-z.subNetworkInstanceConfig.MsgChan():
 			z.subNetworkInstanceConfig.ProcessChange(change)
 
+		case change := <-z.subPatchEnvelopeInfo.MsgChan():
+			z.subPatchEnvelopeInfo.ProcessChange(change)
+
+		case change := <-z.subVolumeStatus.MsgChan():
+			z.subVolumeStatus.ProcessChange(change)
+
+		case change := <-z.subContentTreeStatus.MsgChan():
+			z.subContentTreeStatus.ProcessChange(change)
+
 		case <-z.publishTicker.C:
 			start := time.Now()
 			z.log.Traceln("publishTicker at", time.Now())
@@ -380,6 +415,8 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 			if err != nil {
 				z.log.Errorln(err)
 			}
+
+			z.publishPatchEnvelopesUsage()
 
 			z.pubSub.CheckMaxTimeTopic(agentName, "publishMetrics", start,
 				warningTime, errorTime)
@@ -416,7 +453,7 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 				}
 				if appNetConfig == nil && recUpdate.AppConnStatus.Deleted &&
 					appNetStatus != nil && !appNetStatus.HasError() &&
-					!appNetStatus.Pending() {
+					!appNetStatus.Pending() && appNetStatus.ConfigInSync {
 					z.unpublishAppNetworkStatus(appNetStatus)
 				}
 			}
@@ -450,12 +487,12 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 						appKey, vif.NetAdapterName)
 					continue
 				}
-				for i := range appStatus.UnderlayNetworkList {
-					ulStatus := &appStatus.UnderlayNetworkList[i]
-					if ulStatus.Name != vif.NetAdapterName {
+				for i := range appStatus.AppNetAdapterList {
+					adapterStatus := &appStatus.AppNetAdapterList[i]
+					if adapterStatus.Name != vif.NetAdapterName {
 						continue
 					}
-					z.recordAssignedIPsToULStatus(ulStatus, &newAddrs)
+					z.recordAssignedIPsToAdapterStatus(adapterStatus, &newAddrs)
 					break
 				}
 				z.publishAppNetworkStatus(appStatus)
@@ -589,6 +626,15 @@ func (z *zedrouter) initPublications() (err error) {
 	if err != nil {
 		return err
 	}
+
+	z.pubPatchEnvelopesUsage, err = z.pubSub.NewPublication(pubsub.PublicationOptions{
+		AgentName: agentName,
+		TopicType: types.PatchEnvelopeUsage{},
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -728,7 +774,7 @@ func (z *zedrouter) initSubscriptions() (err error) {
 
 	// Look for geographic location reports
 	z.subLocationInfo, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "nim",
+		AgentName:   "wwan",
 		MyAgentName: agentName,
 		TopicImpl:   types.WwanLocationInfo{},
 		Activate:    false,
@@ -741,7 +787,7 @@ func (z *zedrouter) initSubscriptions() (err error) {
 
 	// Look for cellular status
 	z.subWwanStatus, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "nim",
+		AgentName:   "wwan",
 		MyAgentName: agentName,
 		TopicImpl:   types.WwanStatus{},
 		Activate:    false,
@@ -754,7 +800,7 @@ func (z *zedrouter) initSubscriptions() (err error) {
 
 	// Look for cellular metrics
 	z.subWwanMetrics, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "nim",
+		AgentName:   "wwan",
 		MyAgentName: agentName,
 		TopicImpl:   types.WwanMetrics{},
 		Activate:    false,
@@ -776,6 +822,55 @@ func (z *zedrouter) initSubscriptions() (err error) {
 	if err != nil {
 		return err
 	}
+
+	// Information about patch envelopes
+	z.subPatchEnvelopeInfo, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedagent",
+		MyAgentName:   agentName,
+		TopicImpl:     types.PatchEnvelopeInfoList{},
+		Activate:      false,
+		CreateHandler: z.handlePatchEnvelopeCreate,
+		ModifyHandler: z.handlePatchEnvelopeModify,
+		DeleteHandler: z.handlePatchEnvelopeDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Information about volumes referred in external patch envelopes
+	z.subVolumeStatus, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "volumemgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.VolumeStatus{},
+		Activate:      false,
+		CreateHandler: z.handleVolumeStatusCreate,
+		ModifyHandler: z.handleVolumeStatusModify,
+		DeleteHandler: z.handleVolumeStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
+	// Information about volumes referred in external patch envelopes
+	z.subContentTreeStatus, err = z.pubSub.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "volumemgr",
+		MyAgentName:   agentName,
+		TopicImpl:     types.ContentTreeStatus{},
+		Activate:      false,
+		CreateHandler: z.handleContentTreeStatusCreate,
+		ModifyHandler: z.handleContentTreeStatusModify,
+		DeleteHandler: z.handleContentTreeStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -798,7 +893,7 @@ func (z *zedrouter) processNIReconcileStatus(recStatus nireconciler.NIReconcileS
 		niStatus.BridgeName = recStatus.BrIfName
 		changed = true
 	}
-	if !recStatus.AsyncInProgress {
+	if !recStatus.InProgress {
 		if niStatus.ChangeInProgress != types.ChangeInProgressTypeNone {
 			niStatus.ChangeInProgress = types.ChangeInProgressTypeNone
 			changed = true
@@ -835,31 +930,27 @@ func (z *zedrouter) processAppConnReconcileStatus(
 		}
 		return false
 	}
-	var asyncInProgress bool
+	var inProgress bool
 	var failedItems []string
 	for _, vif := range recStatus.VIFs {
-		asyncInProgress = asyncInProgress || vif.AsyncInProgress
+		inProgress = inProgress || vif.InProgress
 		for itemRef, itemErr := range vif.FailedItems {
 			failedItems = append(failedItems, fmt.Sprintf("%v (%v)", itemRef, itemErr))
 		}
-		for i := range appNetStatus.UnderlayNetworkList {
-			ulStatus := &appNetStatus.UnderlayNetworkList[i]
-			if ulStatus.Name != vif.NetAdapterName {
+		for i := range appNetStatus.AppNetAdapterList {
+			adapterStatus := &appNetStatus.AppNetAdapterList[i]
+			if adapterStatus.Name != vif.NetAdapterName {
 				continue
 			}
-			if ulStatus.Vif != vif.HostIfName {
-				ulStatus.Vif = vif.HostIfName
+			if adapterStatus.Vif != vif.HostIfName {
+				adapterStatus.Vif = vif.HostIfName
 				changed = true
 			}
 		}
 	}
-	if !asyncInProgress {
-		if appNetStatus.Pending() {
-			changed = true
-		}
-		appNetStatus.PendingAdd = false
-		appNetStatus.PendingModify = false
-		appNetStatus.PendingDelete = false
+	if appNetStatus.ConfigInSync != !inProgress {
+		changed = true
+		appNetStatus.ConfigInSync = !inProgress
 	}
 	if len(failedItems) > 0 {
 		err := fmt.Errorf("failed items: %s", strings.Join(failedItems, ";"))
@@ -878,7 +969,7 @@ func (z *zedrouter) processAppConnReconcileStatus(
 
 func (z *zedrouter) ensureDir(path string) error {
 	if _, err := os.Stat(path); err != nil {
-		z.log.Functionf("Create directory %s", runDirname)
+		z.log.Functionf("Create directory %s", path)
 		if err := os.Mkdir(path, 0755); err != nil {
 			return err
 		}
@@ -1069,6 +1160,11 @@ func (z *zedrouter) publishNetworkInstanceMetricsAll(nms *types.NetworkMetrics) 
 	}
 	for _, ni := range niList {
 		status := ni.(types.NetworkInstanceStatus)
+		config := z.lookupNetworkInstanceConfig(status.Key())
+		if config == nil || !config.Activate {
+			// NI was deleted or is inactive - skip metrics publishing.
+			continue
+		}
 		netMetrics := z.createNetworkInstanceMetrics(&status, nms)
 		err := z.pubNetworkInstanceMetrics.Publish(netMetrics.Key(), *netMetrics)
 		if err != nil {
@@ -1135,8 +1231,8 @@ func (z *zedrouter) lookupAppNetworkStatusByAppIP(ip net.IP) *types.AppNetworkSt
 	items := pub.GetAll()
 	for _, st := range items {
 		status := st.(types.AppNetworkStatus)
-		for _, ulStatus := range status.UnderlayNetworkList {
-			if ulStatus.AllocatedIPv4Addr.Equal(ip) {
+		for _, adapterStatus := range status.AppNetAdapterList {
+			if adapterStatus.AllocatedIPv4Addr.Equal(ip) {
 				return &status
 			}
 		}
@@ -1256,4 +1352,49 @@ func (z *zedrouter) getExternalIPForApp(remoteIP net.IP) (net.IP, int) {
 		return nil, http.StatusNoContent
 	}
 	return ip, http.StatusOK
+}
+
+func (z *zedrouter) increasePatchEnvelopeStatusCounter(appUUID string, patch types.PatchEnvelopeInfo) {
+	defaultValue := types.PatchEnvelopeUsage{
+		AppUUID: appUUID,
+		PatchID: patch.PatchID,
+		Version: patch.Version,
+
+		PatchAPICallCount: 1,
+		DownloadCount:     0,
+	}
+	incrementFn := func(v types.PatchEnvelopeUsage) types.PatchEnvelopeUsage {
+		v.PatchAPICallCount++
+		return v
+	}
+	z.patchEnvelopesUsage.ApplyOrStore(defaultValue.Key(), incrementFn, defaultValue)
+}
+
+func (z *zedrouter) increasePatchEnvelopeDownloadCounter(appUUID string, patch types.PatchEnvelopeInfo) {
+	defaultValue := types.PatchEnvelopeUsage{
+		AppUUID: appUUID,
+		PatchID: patch.PatchID,
+		Version: patch.Version,
+
+		PatchAPICallCount: 0,
+		DownloadCount:     1,
+	}
+	incrementFn := func(v types.PatchEnvelopeUsage) types.PatchEnvelopeUsage {
+		v.DownloadCount++
+		return v
+	}
+	z.patchEnvelopesUsage.ApplyOrStore(defaultValue.Key(), incrementFn, defaultValue)
+}
+
+func (z *zedrouter) publishPatchEnvelopesUsage() {
+	publishFn := func(_ string, peUsage types.PatchEnvelopeUsage) bool {
+		key := peUsage.Key()
+		pub := z.pubPatchEnvelopesUsage
+		err := pub.Publish(key, peUsage)
+		if err != nil {
+			z.log.Errorf("publishPatchEnvelopesUsage failed: %v", err)
+		}
+		return true
+	}
+	z.patchEnvelopesUsage.Range(publishFn)
 }

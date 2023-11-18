@@ -24,9 +24,9 @@ import (
 	"os"
 	"strings"
 
-	zauth "github.com/lf-edge/eve/api/go/auth"
-	zcert "github.com/lf-edge/eve/api/go/certs"
-	zcommon "github.com/lf-edge/eve/api/go/evecommon"
+	zauth "github.com/lf-edge/eve-api/go/auth"
+	zcert "github.com/lf-edge/eve-api/go/certs"
+	zcommon "github.com/lf-edge/eve-api/go/evecommon"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	etpm "github.com/lf-edge/eve/pkg/pillar/evetpm"
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -47,8 +47,8 @@ const (
 //   - SendRetval.Status is potentially updated to reflect the result of auth verification
 //
 // If skipVerify we remove the envelope but do not verify the signature.
-func RemoveAndVerifyAuthContainer(
-	ctx *ZedCloudContext, sendRV *SendRetval, skipVerify bool) error {
+func RemoveAndVerifyAuthContainer(ctx *ZedCloudContext,
+	sendRV *SendRetval, skipVerify bool) error {
 	var reqURL string
 	if strings.HasPrefix(sendRV.ReqURL, "http:") {
 		reqURL = sendRV.ReqURL
@@ -62,7 +62,8 @@ func RemoveAndVerifyAuthContainer(
 	if !ctx.V2API {
 		return nil
 	}
-	contents, status, err := removeAndVerifyAuthContainer(ctx, sendRV.RespContents, skipVerify)
+	contents, status, err := removeAndVerifyAuthContainer(ctx,
+		sendRV.RespContents, skipVerify)
 	if status != types.SenderStatusNone {
 		sendRV.Status = status
 	}
@@ -88,7 +89,8 @@ func RemoveAndVerifyAuthContainer(
 
 // given an envelope protobuf received from controller, verify the authentication
 // If skipVerify we parse the envelope but do not verify the content.
-func removeAndVerifyAuthContainer(ctx *ZedCloudContext, c []byte, skipVerify bool) ([]byte, types.SenderStatus, error) {
+func removeAndVerifyAuthContainer(ctx *ZedCloudContext,
+	c []byte, skipVerify bool) ([]byte, types.SenderStatus, error) {
 	senderSt := types.SenderStatusNone
 	sm := &zauth.AuthContainer{}
 	err := proto.Unmarshal(c, sm)
@@ -99,14 +101,6 @@ func removeAndVerifyAuthContainer(ctx *ZedCloudContext, c []byte, skipVerify boo
 	}
 
 	if !skipVerify { // no verify for /certs itself
-		if ctx.serverSigningCert == nil {
-			err = loadSavedServerSigningCert(ctx)
-			if err != nil {
-				ctx.log.Errorf(
-					"removeAndVerifyAuthContainer: can not load save server cert, %v\n", err)
-				return nil, senderSt, err
-			}
-		}
 		senderSt, err = VerifyAuthContainer(ctx, sm)
 		if err != nil { // already logged
 			return nil, senderSt, err
@@ -116,11 +110,16 @@ func removeAndVerifyAuthContainer(ctx *ZedCloudContext, c []byte, skipVerify boo
 	return sm.ProtectedPayload.GetPayload(), senderSt, nil
 }
 
-// VerifyAuthContainer verifies the integrity of the payload inside AuthContainer.
-func VerifyAuthContainer(ctx *ZedCloudContext, sm *zauth.AuthContainer) (types.SenderStatus, error) {
+// VerifyAuthContainerHeader verifies correctness of algorithm fields in header
+func VerifyAuthContainerHeader(ctx *ZedCloudContext, sm *zauth.AuthContainer) (
+	types.SenderStatus, error) {
+	err := LoadSavedServerSigningCert(ctx)
+	if err != nil {
+		return types.SenderStatusNone, err
+	}
 	if len(sm.GetSenderCertHash()) != hashSha256Len16 &&
 		len(sm.GetSenderCertHash()) != hashSha256Len32 {
-		err := fmt.Errorf("VerifyAuthContainer: unexpected senderCertHash length (%d)",
+		err := fmt.Errorf("VerifyAuthContainerHeader: unexpected senderCertHash length (%d)",
 			len(sm.GetSenderCertHash()))
 		ctx.log.Error(err)
 		return types.SenderStatusHashSizeError, err
@@ -129,33 +128,43 @@ func VerifyAuthContainer(ctx *ZedCloudContext, sm *zauth.AuthContainer) (types.S
 	switch sm.Algo {
 	case zcommon.HashAlgorithm_HASH_ALGORITHM_SHA256_32BYTES:
 		if bytes.Compare(sm.GetSenderCertHash(), ctx.serverSigningCertHash) != 0 {
-			ctx.log.Errorf("VerifyAuthContainer: local server cert hash (%d)"+
+			ctx.log.Errorf("VerifyAuthContainerHeader: local server cert hash (%d)"+
 				"does not match in authen (%d): %v, %v",
 				len(ctx.serverSigningCertHash), len(sm.GetSenderCertHash()),
 				ctx.serverSigningCertHash, sm.GetSenderCertHash())
-			err := fmt.Errorf("VerifyAuthContainer: local server cert hash " +
+			err := fmt.Errorf("VerifyAuthContainerHeader: local server cert hash " +
 				"does not match in authen (32 bytes)")
 			return types.SenderStatusCertMiss, err
 		}
 	case zcommon.HashAlgorithm_HASH_ALGORITHM_SHA256_16BYTES:
 		if bytes.Compare(sm.GetSenderCertHash(), ctx.serverSigningCertHash[:hashSha256Len16]) != 0 {
-			ctx.log.Errorf("VerifyAuthContainer: local server cert hash (%d)"+
+			ctx.log.Errorf("VerifyAuthContainerHeader: local server cert hash (%d)"+
 				"does not match in authen (%d): %v, %v",
 				len(ctx.serverSigningCertHash), len(sm.GetSenderCertHash()),
 				ctx.serverSigningCertHash, sm.GetSenderCertHash())
-			err := fmt.Errorf("VerifyAuthContainer: local server cert hash " +
+			err := fmt.Errorf("VerifyAuthContainerHeader: local server cert hash " +
 				"does not match in authen (16 bytes)")
 			return types.SenderStatusCertMiss, err
 		}
 	default:
-		err := fmt.Errorf("VerifyAuthContainer: hash algorithm is not supported")
+		err := fmt.Errorf("VerifyAuthContainerHeader: hash algorithm is not supported")
 		ctx.log.Error(err)
 		return types.SenderStatusAlgoFail, err
 	}
 
+	return types.SenderStatusNone, nil
+}
+
+// VerifyAuthContainer verifies the integrity of the payload inside AuthContainer.
+func VerifyAuthContainer(ctx *ZedCloudContext, sm *zauth.AuthContainer) (types.SenderStatus, error) {
+	status, err := VerifyAuthContainerHeader(ctx, sm)
+	if err != nil {
+		return status, err
+	}
+	// Verify payload integrity
 	data := sm.ProtectedPayload.GetPayload()
 	hash := ComputeSha(data)
-	err := verifyAuthSig(ctx, sm.GetSignatureHash(), ctx.serverSigningCert, hash)
+	err = verifyAuthSig(ctx, sm.GetSignatureHash(), ctx.ServerSigningCert, hash)
 	if err != nil {
 		err = fmt.Errorf("VerifyAuthContainer: verifyAuthSig error %v\n", err)
 		ctx.log.Error(err)
@@ -164,34 +173,29 @@ func VerifyAuthContainer(ctx *ZedCloudContext, sm *zauth.AuthContainer) (types.S
 	return types.SenderStatusNone, nil
 }
 
-func loadSavedServerSigningCert(ctx *ZedCloudContext) error {
+// LoadSavedServerSigningCert loads server (i.e. controller) signing
+// certificate stored in the file into the zedcloud context.
+func LoadSavedServerSigningCert(ctx *ZedCloudContext) error {
+	if ctx.ServerSigningCert != nil {
+		// Already loaded
+		return nil
+	}
 	certBytes, err := os.ReadFile(types.ServerSigningCertFileName)
 	if err != nil {
 		ctx.log.Errorf("loadSavedServerSigningCert: can not read in server cert file, %v\n", err)
 		return err
 	}
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		err := fmt.Errorf("loadSavedServerSigningCert: can not get client Cert")
-		return err
-	}
-
-	sCert, err := x509.ParseCertificate(block.Bytes)
+	err = LoadServerSigningCert(ctx, certBytes)
 	if err != nil {
-		ctx.log.Errorf("loadSavedServerSigningCert: can not parse cert %v\n", err)
+		ctx.log.Errorf("loadServerSigningCert: can not load save server cert, %v\n", err)
 		return err
 	}
-
-	// hash verify using PEM bytes from cloud
-	ctx.serverSigningCertHash = ComputeSha(certBytes)
-	ctx.serverSigningCert = sCert
-
 	return nil
 }
 
 // ClearCloudCert - zero out cached cloud certs in client zedcloudCtx
 func ClearCloudCert(ctx *ZedCloudContext) {
-	ctx.serverSigningCert = nil
+	ctx.ServerSigningCert = nil
 	ctx.serverSigningCertHash = nil
 }
 
@@ -596,7 +600,7 @@ func LoadServerSigningCert(ctx *ZedCloudContext, certByte []byte) error {
 	}
 
 	// store the certificate
-	ctx.serverSigningCert = leafCert
+	ctx.ServerSigningCert = leafCert
 
 	// store the certificate hash
 	ctx.serverSigningCertHash = ComputeSha(certByte)

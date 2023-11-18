@@ -15,7 +15,7 @@ To handle different types of connectivity towards the controller EVE supports bo
 Load spreading means that there are two or more similar uplink network, for instance two Ethernet ports for redundancy, the EVE will send different requests over different connections in a round-robin fashion.
 Failover means that a device can have different types of uplink networks, for example Ethernet, LTE, and/or satellite connectivity. In such a case a cost can be assigned to each uplink port so that e.g., LTE (the wwan0 port) is only used if EVE can not connect via any lower cost (e.g., one or more Ethernet) ports.
 
-That is accomplished in the below configuration, which uses the ```DevicePortConfig``` type, by specifying the ```Cost``` integer. In the in the [API](../api/proto/config/devmodel.proto) the corresponding field is the ```cost``` in the SystemAdapter message.
+That is accomplished in the below configuration, which uses the ```DevicePortConfig``` type, by specifying the ```Cost``` integer. In the in the [API](https://github.com/lf-edge/eve-api/tree/main/proto/config/devmodel.proto) the corresponding field is the ```cost``` in the SystemAdapter message.
 
 The cost is a number between 0 and 255, with zero (the default) implying free, and less preferred ports being assigned a higher cost. Multiple ports can be assigned the same cost, in which case once failover has happened to cost N, then all uplink ports with cost N will be used for load spreading of the management traffic.
 
@@ -33,7 +33,7 @@ When EVE is installed using a generic EVE installer without device bootstrap con
 
 - DHCP is enabled on one of the Ethernet ports
 - WiFi is not assumed (since WiFi needs credentials)
-- If cellular connectivity is assumed, the default APN (`internet`) will work to connect to the network
+- Cellular connectivity is not assumed (without cellular config every discovered modem will have RF function disabled)
 - No enterprise proxy configuration is required to be able to connect to the controller.
 
 If any of those assumptions is not satisfied, then it is necessary to either install EVE using a single-use EVE installer, shipped with the initial "bootstrap" configuration prepared for the target device (the preferred method) or to use one of the legacy mechanisms for off-line configuration management.
@@ -60,12 +60,12 @@ That ensures that the configuration doesn't revert back once the device has conn
 The SystemAdapter in the API specifies the intended port configuration.
 This is fed into the logic in nim by [zedagent](../pkg/pillar/cmd/zedagent) publishing a ```DevicePortConfig``` item.
 
-The API for this is [SystemAdapter](../api/proto/config/devmodel.proto).
+The API for this is [SystemAdapter](https://github.com/lf-edge/eve-api/tree/main/proto/config/devmodel.proto).
 At least one port must be set to be a management port, and that port needs to refer to a network with IP configuration for the device to even try to use the SystemAdapter configuration.
 
 ### Last resort
 
-If `network.fallback.any.eth` [configuration property](CONFIG-PROPERTIES.md) is set to `enabled` (by default it is disabled), then there is an additional lowest priority item in the list of DevicePortConfigs, called "Last resort" DPC (pubsub key `lastresort`), based on finding all of the Ethernet and Ethernet-like interfaces (an example of the latter is WiFi and cellular modems) which are not used exclusively by applications. The last resort configuration assumes DHCP and no enterprise proxies.
+If `network.fallback.any.eth` [configuration property](CONFIG-PROPERTIES.md) is set to `enabled` (by default it is disabled), then there is an additional lowest priority item in the list of DevicePortConfigs, called "Last resort" DPC (pubsub key `lastresort`), based on finding all Ethernet interfaces (i.e. excluding wireless connectivity options) which are not used exclusively by applications. The last resort configuration assumes DHCP and no enterprise proxies.
 
 However, independent of the above property setting, if the device has no source of network configuration available (no bootstrap, override or persisted config), then EVE will use the Last resort *forcefully*. This, for example, happens when device boots for the very first time, without [bootstrap config](#bootstrap-configuration) or the (legacy) network config override being provided. In that case, device may remain stuck with no connectivity indefinitely (unless the user plugs in a USB stick with a network config later), therefore EVE will try to use Last resort to see if it can provide connectivity with the controller. Once device obtains a proper network config (from the controller or a USB stick), EVE will stop using Last resort forcefully and will keep this network config inside `DevicePortConfigList` only if and as long as it is enabled explicitly by the config (`network.fallback.any.eth` is `enabled`).
 
@@ -103,13 +103,13 @@ The testing is triggered by receiving a new configuration from the controller (o
 [TBD Should we verify that the new configuration is usable for some minimum time e.g., 10 minutes before discarding the previous/fallback configuration?]
 
 If no management port can be used to reach the controller, then nim switches to using the next configuration in the DevicePortConfigList, which is normally the previously used configuration.
-In that case a failure is reported in the [SystemAdapterInfo](../api/proto/info/info.proto) by setting lastError in DevicePortStatus and the currentIndex is set to the currently used DevicePortStatus in the list. Note that lastFailed and lastSucceeded can be used to see if a configuration has succeeded in the past or always failed.
+In that case a failure is reported in the [SystemAdapterInfo](https://github.com/lf-edge/eve-api/tree/main/proto/info/info.proto) by setting lastError in DevicePortStatus and the currentIndex is set to the currently used DevicePortStatus in the list. Note that lastFailed and lastSucceeded can be used to see if a configuration has succeeded in the past or always failed.
 
 ### Periodic testing
 
 The default timer for this is 5 minutes and can be set with [timer.port.testinterval](CONFIG-PROPERTIES.md). At those intervals the device verifies that it can still reach the controller using one of the management ports.
 
-Each attempt it starts with a different management port, which ensures that all management ports are tested for connectivity. Any management port which sees a failure gets an error in the [SystemAdapterInfo](../api/proto/info/info.proto) in the ErrorInfo for the particular DevicePort.
+Each attempt it starts with a different management port, which ensures that all management ports are tested for connectivity. Any management port which sees a failure gets an error in the [SystemAdapterInfo](https://github.com/lf-edge/eve-api/tree/main/proto/info/info.proto) in the ErrorInfo for the particular DevicePort.
 
 Note that if a port was tested and succeeded the ErrorInfo.timestamp is updated and the ErrorInfo.description is empty; this indicates the most recent successful test.
 
@@ -133,7 +133,7 @@ In those cases nim proceeds with the current configuration and assumes that the 
 
 ## Failure reporting
 
-The device reports the status of all of the device connectivity using [SystemAdapterInfo](../api/proto/info/info.proto). There are two levels of errors:
+The device reports the status of all of the device connectivity using [SystemAdapterInfo](https://github.com/lf-edge/eve-api/tree/main/proto/info/info.proto). There are two levels of errors:
 
 - A new SystemAdapter configuration was tested, but none of the management ports could be used to connect to the controller. In that case a failure is reported by setting lastError in DevicePortStatus and the currentIndex is set to the currently used DevicePortStatus in the list. Note that lastFailed and lastSucceeded can be used to see if a configuration has succeeded in the past or always failed.
 - A particular management port could not be used to reach the controller. In that case the ErrorInfo for the particular DevicePort is set to indicate the error and timestamp.
@@ -189,7 +189,7 @@ with `eve verbose off`.
 ### Connectivity-Related Logs
 
 The progression and outcome of [network configuration testing](#testing) is logged with messages
-prefixed with `DPC verify:` (not that DPC is abbreviation for `DevicePortConfig`, which is a Go
+prefixed with `DPC verify:` (note that DPC is abbreviation for `DevicePortConfig`, which is a Go
 structure holding configuration for all management and app-shared interfaces). These messages
 can explain why a particular device is not using the latest configuration but instead has fallen
 back to a previous one. These logs are quite concise yet pack enough information to tell when
@@ -222,7 +222,7 @@ the current config/state/metrics as published by EVE microservices.
 For device connectivity, the particularly interesting topics are those published by Network
 Interface Manager (NIM for short):
 
--`/persist/status/nim/DevicePortConfigList/global.json`: contains the set of DevicePortConfig-s
+- `/persist/status/nim/DevicePortConfigList/global.json`: contains the set of DevicePortConfig-s
  (configurations for mgmt and app-shared ports) which are currently known to the device
  (the latest highest-priority DPC plus some persisted previous configs). These configs are sorted
  in priority-decreasing order, i.e. the latest config is at the index 0. Additionally, there is
@@ -232,6 +232,7 @@ Interface Manager (NIM for short):
  by the last test). `State` is an enum value but in this file presented with its integer representation.
  To learn what a given `State` number means, look for the `DPCState` enum in
  [zedroutertypes.go](../pkg/pillar/types/zedroutertypes.go).
+
 - `/run/nim/DeviceNetworkStatus/global.json`: contains state information for the currently applied
  DPC. For every port it shows the currently assigned IP addresses, DNS servers, IP-based geolocation
  info, MAC address, administrative status (up/down), WiFi/cellular-specific details for wireless
@@ -254,30 +255,36 @@ troubleshooting:
 
 - `/run/zedagent/DevicePortConfig/zedagent.json`: currently published DPC from zedagent (either
  coming from the controller or from a bootstrap config, see [CONFIG.md](./CONFIG.md)).
+
 - `/run/zedagent/PhysicalIOAdapterList/zedagent.json`: list of physical IO adapters, published
  from zedagent but ultimately coming from the device model. This includes network adapters
  with their specification (PCI addresses, kernel interface names, etc.).
+
 - `/run/domainmgr/AssignableAdapters/global.json`: the spec and state of physical IO adapters
  after being processed by [domainmgr microservice](../pkg/pillar/cmd/domainmgr). This means after
  each was assigned to the corresponding domain and available to be used either by NIM (for mgmt or
  as app-shared) or by an app (as app-direct). NIM waits for `AssignableAdapters` before applying
  DPC config. Change in `AssignableAdapters` can also trigger DPC re-testing or unblock NIM
  to apply a given DPC (e.g. a particular port is finally available in dom0).
+
 - `/persist/status/zedclient/OnboardingStatus/global.json`: the status of the onboarding procedure.
  Once device is onboarded, `DeviceUUID` field will be non-empty and contain the assigned
  device UUID (also printed to `/persist/status/uuid`).
 
-Finally, the [wwan microservice](../pkg/wwan), managing the [cellular connectivity](./WIRELESS.md),
-is a shell script outside of the pillar container, not using pubsub for IPC. Instead, it exchanges
-wwan config, status and metrics with NIM simply by reading/writing files located under `/run/wwan`
-directory:
+For WWAN connectivity info, refer to these pubsub topics:
 
-- `config.json` is published by NIM and may contain configuration for a cellular modem.
-- `status.json` and `metrics.json` are published by wwan microservice to inform NIM about the current
- cellular connectivity status and to publish packet/byte counters, respectively.
-- `resolv.conf/<interface-name>.dhcp` contains the list of nameservers that should be used with
- a given wwan interface (published by wwan to NIM and further via `DeviceNetworkStatus` to other
- microservices, like downloader)
+- `/run/nim/WwanConfig/global.json` is published by NIM and contains configuration for cellular modems.
+- `/run/wwan/WwanStatus/global.json` is published by wwan microservice to inform zedagent, NIM
+  and some other microservices about the current cellular connectivity status.
+- `/run/wwan/WwanMetrics/global.json` is published by wwan microservice and contains packet/byte
+  counters reported by cellular modems (i.e. not from the Linux network stack)
+
+Separately to pubsub topics, file `/run/wwan/resolv.conf/<interface-name>.dhcp` is updated
+by the wwan microservice and contain the list of nameservers that should be used with the given
+wwan interface. This is similar to how dhcpcd reports DNS servers for ethernet interfaces
+(for both DHCP and static IP config). In NIM, where this info is processed and further published
+via `DeviceNetworkStatus` pubsub topic, we can therefore process nameservers for ethernet
+and wwan interfaces in a very similar way and reuse some code.
 
 ### Netdump and Nettrace
 
@@ -285,7 +292,7 @@ EVE performs all communication with the controller over the HTTP protocol using 
 for Go. Additionally, the same protocol and the client are typically also used to download EVE/app
 images from data stores. Given all that, it is useful to be able to obtain diagnostics from HTTP
 requests processing as done by `http.Client` and use it for connectivity troubleshooting.
-For exactly this purpose we implemented [nettrace package](../libs/nettrace/README.md),
+For exactly this purpose we implemented [nettrace package](https://github.com/lf-edge/eve-libs/blob/main/nettrace/README.md),
 which internally wraps and injects hooks into `http.Client` to monitor and record a summary of
 all important network operations that happen behind the scenes during request processing at different
 layers of the network stacks, denoted as "network traces" (or just collectively denoted as "network trace"
@@ -334,7 +341,7 @@ topic name with a publication timestamp plus the `.tgz` extension, for example:
 `downloader-fail-2023-01-03T14-25-04.tgz`, `nim-ok-2023-01-03T13-30-36`, etc.
 
 Not all microservices that communicate over the network are traced and contribute with netdumps.
-Currently traced HTTP requests are:
+Currently, traced HTTP requests are:
 
 - `/ping` request done by NIM to verify connectivity for the *latest* DPC (testing of older DPCs
  is never traced). Packet capture is also enabled and the obtained pcap files are included in

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	zconfig "github.com/lf-edge/eve/api/go/config"
+	zconfig "github.com/lf-edge/eve-api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	uuid "github.com/satori/go.uuid"
 )
@@ -98,7 +98,7 @@ func (config VolumeConfig) LogKey() string {
 	return string(base.VolumeConfigLogType) + "-" + config.Key()
 }
 
-//volumeSubState is type for defining additional statuses for VolumeStatus
+// volumeSubState is type for defining additional statuses for VolumeStatus
 type volumeSubState uint8
 
 // Enum of volumeSubState variants
@@ -237,6 +237,73 @@ func (status VolumeStatus) LogDelete(logBase *base.LogObject) {
 // LogKey :
 func (status VolumeStatus) LogKey() string {
 	return string(base.VolumeStatusLogType) + "-" + status.Key()
+}
+
+// VolumesSnapshotAction is the action to perform on the snapshot
+type VolumesSnapshotAction uint8
+
+const (
+	// VolumesSnapshotUnspecifiedAction is the default value
+	VolumesSnapshotUnspecifiedAction VolumesSnapshotAction = iota
+	// VolumesSnapshotCreate is used to create a snapshot
+	VolumesSnapshotCreate
+	// VolumesSnapshotRollback is used to roll back to a snapshot
+	VolumesSnapshotRollback
+	// VolumesSnapshotDelete is used to delete a snapshot
+	VolumesSnapshotDelete
+)
+
+func (action VolumesSnapshotAction) String() string {
+	switch action {
+	case VolumesSnapshotCreate:
+		return "Create"
+	case VolumesSnapshotRollback:
+		return "Rollback"
+	case VolumesSnapshotDelete:
+		return "Delete"
+	default:
+		return "Unspecified"
+	}
+}
+
+// VolumesSnapshotConfig is used to send snapshot requests from zedmanager to volumemgr
+type VolumesSnapshotConfig struct {
+	// SnapshotID is the ID of the snapshot
+	SnapshotID string
+	// Action is the action to perform on the snapshot
+	Action VolumesSnapshotAction
+	// VolumeIDs is a list of volumes to snapshot
+	VolumeIDs []uuid.UUID
+	// AppUUID used as a backlink to the app
+	AppUUID uuid.UUID
+}
+
+// Key returns unique key for the snapshot
+func (config VolumesSnapshotConfig) Key() string {
+	return config.SnapshotID
+}
+
+// VolumesSnapshotStatus is used to send snapshot status from volumemgr to zedmanager
+type VolumesSnapshotStatus struct {
+	// SnapshotID is the ID of the snapshot, critical field
+	SnapshotID string `mandatory:"true"`
+	// Metadata is a map of volumeID to metadata, depending on the volume type. Critical field.
+	VolumeSnapshotMeta map[string]interface{} `mandatory:"true"`
+	// TimeCreated is the time the snapshot was created, reported by FS-specific code
+	TimeCreated time.Time
+	// AppUUID used as a backlink to the app, critical field
+	AppUUID uuid.UUID `mandatory:"true"`
+	// RefCount is the number of times the snapshot is used. Necessary to trigger the handleModify handler
+	RefCount int
+	// ResultOfAction is the type of action that was performed on the snapshot that resulted in this status
+	ResultOfAction VolumesSnapshotAction
+	// ErrorAndTimeWithSource provides SetErrorNow() and ClearError()
+	ErrorAndTimeWithSource
+}
+
+// Key returns unique key for the snapshot
+func (status VolumesSnapshotStatus) Key() string {
+	return status.SnapshotID
 }
 
 // VolumeRefConfig : Reference to a Volume specified separately in the API

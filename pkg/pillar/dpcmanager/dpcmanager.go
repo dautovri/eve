@@ -62,8 +62,7 @@ type DpcManager struct {
 
 	// Keep nil values to let DpcManager to use default implementations.
 	// It is useful to override for unit testing purposes.
-	WwanWatcher WwanWatcher
-	GeoService  GeolocationService
+	GeoService GeolocationService
 
 	// Minimum time that should pass after a DPC verification failure
 	// until the DPC is eligible for another round of verification.
@@ -81,9 +80,6 @@ type DpcManager struct {
 	PubDummyDevicePortConfig pubsub.Publication // for logging
 	PubDevicePortConfigList  pubsub.Publication
 	PubDeviceNetworkStatus   pubsub.Publication
-	PubWwanStatus            pubsub.Publication
-	PubWwanMetrics           pubsub.Publication
-	PubWwanLocationInfo      pubsub.Publication
 
 	// Metrics
 	ZedcloudMetrics *zedcloud.AgentMetrics
@@ -93,7 +89,8 @@ type DpcManager struct {
 	adapters         types.AssignableAdapters
 	globalCfg        types.ConfigItemValueMap
 	hasGlobalCfg     bool
-	radioSilence     types.RadioSilence
+	rsConfig         types.RadioSilence
+	rsStatus         types.RadioSilence
 	enableLastResort bool
 	devUUID          uuid.UUID
 	// Boot-time configuration
@@ -106,12 +103,10 @@ type DpcManager struct {
 	reconcileStatus dpcreconciler.ReconcileStatus
 	deviceNetStatus types.DeviceNetworkStatus
 	wwanStatus      types.WwanStatus
-	wwanMetrics     types.WwanMetrics
 
 	// Channels
 	inputCommands chan inputCommand
 	networkEvents <-chan netmonitor.Event
-	wwanEvents    <-chan WwanEvent
 
 	// Timers
 	dpcTestTimer          *time.Timer
@@ -129,6 +124,7 @@ type DpcManager struct {
 	netDumper       *netdump.NetDumper // nil if netdump is disabled
 	netdumpInterval time.Duration
 	lastNetdumpPub  time.Time // last call to publishNetdump
+	startTime       time.Time
 }
 
 // Watchdog : methods used by DpcManager to interact with Watchdog.
@@ -189,15 +185,17 @@ const (
 	commandUpdateAA
 	commandUpdateRS
 	commandUpdateDevUUID
+	commandProcessWwanStatus
 )
 
 type inputCommand struct {
-	cmd     command
-	dpc     types.DevicePortConfig   // for commandAddDPC and commandDelDPC
-	gcp     types.ConfigItemValueMap // for commandUpdateGCP
-	aa      types.AssignableAdapters // for commandUpdateAA
-	rs      types.RadioSilence       // for commandUpdateRS
-	devUUID uuid.UUID                // for commandUpdateDevUUID
+	cmd        command
+	dpc        types.DevicePortConfig   // for commandAddDPC and commandDelDPC
+	gcp        types.ConfigItemValueMap // for commandUpdateGCP
+	aa         types.AssignableAdapters // for commandUpdateAA
+	rs         types.RadioSilence       // for commandUpdateRS
+	devUUID    uuid.UUID                // for commandUpdateDevUUID
+	wwanStatus types.WwanStatus         // for commandProcessWwanStatus
 }
 
 type dpcVerify struct {
@@ -211,9 +209,6 @@ type dpcVerify struct {
 func (m *DpcManager) Init(ctx context.Context) error {
 	m.dpcVerify.crucialIfs = make(map[string]netmonitor.IfAttrs)
 	m.inputCommands = make(chan inputCommand, 10)
-	if m.WwanWatcher == nil {
-		m.WwanWatcher = &wwanWatcher{Log: m.Log}
-	}
 	if m.GeoService == nil {
 		m.GeoService = &geoService{}
 	}
@@ -238,12 +233,8 @@ func (m *DpcManager) Init(ctx context.Context) error {
 
 // Run DpcManager as a separate task with its own loop and a watchdog file.
 func (m *DpcManager) Run(ctx context.Context) (err error) {
+	m.startTime = time.Now()
 	m.networkEvents = m.NetworkMonitor.WatchEvents(ctx, "dpc-reconciler")
-	m.wwanEvents, err = m.WwanWatcher.Watch(ctx)
-	if err != nil {
-		return err
-	}
-
 	go m.run(ctx)
 	return nil
 }
@@ -275,6 +266,8 @@ func (m *DpcManager) run(ctx context.Context) {
 				m.doUpdateRadioSilence(ctx, inputCmd.rs)
 			case commandUpdateDevUUID:
 				m.doUpdateDevUUID(ctx, inputCmd.devUUID)
+			case commandProcessWwanStatus:
+				m.processWwanStatus(ctx, inputCmd.wwanStatus)
 			}
 			m.resumeVerifyIfAsyncDone(ctx)
 
@@ -394,22 +387,6 @@ func (m *DpcManager) run(ctx context.Context) {
 				m.updateDNS()
 			}
 
-		case event, ok := <-m.wwanEvents:
-			if !ok {
-				m.Log.Warnf("Wwan watcher stopped")
-				continue
-			}
-			switch event {
-			case WwanEventUndefined:
-				m.Log.Warnf("Undefined event received from WwanWatcher")
-			case WwanEventNewStatus:
-				m.reloadWwanStatus()
-			case WwanEventNewMetrics:
-				m.reloadWwanMetrics()
-			case WwanEventNewLocationInfo:
-				m.reloadWwanLocationInfo()
-			}
-
 		case <-ctx.Done():
 			return
 
@@ -424,7 +401,7 @@ func (m *DpcManager) reconcilerArgs() dpcreconciler.Args {
 	args := dpcreconciler.Args{
 		GCP: m.globalCfg,
 		AA:  m.adapters,
-		RS:  m.radioSilence,
+		RS:  m.rsConfig,
 	}
 	if m.currentDPC() != nil {
 		args.DPC = *m.currentDPC()
@@ -488,6 +465,14 @@ func (m *DpcManager) UpdateDevUUID(devUUID uuid.UUID) {
 	}
 }
 
+// ProcessWwanStatus : process an update of cellular connectivity status.
+func (m *DpcManager) ProcessWwanStatus(wwanStatus types.WwanStatus) {
+	m.inputCommands <- inputCommand{
+		cmd:        commandProcessWwanStatus,
+		wwanStatus: wwanStatus,
+	}
+}
+
 // GetDNS returns device network state information.
 func (m *DpcManager) GetDNS() types.DeviceNetworkStatus {
 	return m.deviceNetStatus
@@ -503,7 +488,7 @@ func (m *DpcManager) doUpdateGCP(ctx context.Context, gcp types.ConfigItemValueM
 		time.Duration(m.globalCfg.GlobalValueInt(types.NetworkTestBetterInterval))
 	testDuration := time.Second *
 		time.Duration(m.globalCfg.GlobalValueInt(types.NetworkTestDuration))
-	// We refresh the gelocation information when the underlay
+	// We refresh the gelocation information when the underlay aka public
 	// IP address(es) change, plus periodically with this interval.
 	geoRedoInterval := time.Second *
 		time.Duration(m.globalCfg.GlobalValueInt(types.NetworkGeoRedoTime))

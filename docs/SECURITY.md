@@ -19,7 +19,6 @@ We have made an effort to provide users of EVE with a system that is both practi
 * Remote attestation and measured boot
 * Robust trust model between EVE and its controller
 * Workloads which are immutable
-* Secure overlay network
 
 In the rest of this document, we explain these principles and discuss some expected use cases for Edge Node devices running EVE.  We then give a high-level overview of the threat model against which we will endeavor to protect our users, while still enabling them to make full use of their cloud-based controller orchestration service.
 
@@ -74,11 +73,11 @@ Given the complexity of designing such a protocol for EVE (especially solving th
 
 If there's an attempted modification of either controller's address (stored in /config/server) and controller's Root CA (/config/root-certificate.pem) Edge Node should get disconnected from the controller and should be forced to do a hardware-assisted clear operation and start all over again.
 
-On systems where TPM is available, the idea is to change TPM authentication policy from password to HMAC based authentication (TPM2_PolicyAuthValue), with hash calculated from the Root CA.  When device key is created, HMAC from Root CA will be passed, which is to be honored for every TPM command related to the key entity. i.e Each time Sign command is passed to TPM, the Root CA hash needs to be the same. If someone changes Root CA, HMAC will not match, and the device will be disconnected from the controller, forcing the user to do a TPM clear and start all over again.
+In the current implementation of EVE, if TPM is available, controller's address and controller's Root CA are measured into TPM as part of vault key access control policy meaning any changes in those data will prevent the system to get access to the vault key at the next boot up.
 
 ### EVE trusting side-channel configuration
 
-The use of [object signing](../api/OBJECT-SIGNING.md) is designed to enable delivering device configuration using side channels such as USB sticks. But the details of timestamp checks to avoid replay attacks has yet to be designed and implemented. Those aspects are [TBD](https://github.com/lf-edge/eve/issues/233)
+The use of [object signing](https://github.com/lf-edge/eve-api/tree/main/OBJECT-SIGNING.md) is designed to enable delivering device configuration using side channels such as USB sticks. But the details of timestamp checks to avoid replay attacks has yet to be designed and implemented. Those aspects are [TBD](https://github.com/lf-edge/eve/issues/233)
 
 ### Identity of EVE's instance
 
@@ -148,15 +147,9 @@ requires participation of both parties, controller and device, to use the backup
 To decrypt the key, one has to be on the same device with access to the same TPM, and the firmware+software on that device has to pass the
 [remote attestation](https://wiki.lfedge.org/display/EVE/Measured+Boot+and+Remote+Attestation) check in the controller.
 
-## Secure Overlay Network
+## Disabling Remote Access
 
-EVE provides a secure overlay network for ECOS for cases when east-west communication is needed between ECOS. This is built using [LISP](https://tools.ietf.org/html/rfc6830) with a strong security foundation. Each ECO is attached to a mesh network instance which describes common parameters for the overlay network such as the location of the LISP RTR.
-
-Each ECO has a unique certificate and private key generated when the ECO is deployed, and the LISP endpoint identifier contains a hash of that public key. This enables secure authenticated registrations with the LISP map server since the device can prove that it owns the private key whose hash is in the EID as part of the LISP register message.
-
-Two ECOs communicating using the overlay will get an secure channel since LISP will perform a key exchange using the pair of public keys (which are bound to the EIDs per above).
-
-In addition, the LISP map server can provide ability to limit access to the mappings for certain EIDs based on the EID which is trying to look them up.
+EVE provides a mechanism to build an image with remote access disabled (edge-view and ssh), this can be done by configuring EVE when building an installer. Enabling remote access back requires access to the cloud controller to enable console keyboard access on the edge node, plus physical access to the edge node to issue `eve remote-access` command on the edge node. In addition changing remote access status from its initial value to anything else will result in change of PCR-14 value and subsequent failure in unsealing the vault key that needs to be handled using the cloud controller. Check [config document](CONFIG.md#eve-configuration) for more information.
 
 ## Details on keys and certificates
 

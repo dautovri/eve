@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"net"
 
-	dg "github.com/lf-edge/eve/libs/depgraph"
-	"github.com/lf-edge/eve/pkg/pillar/utils"
+	dg "github.com/lf-edge/eve-libs/depgraph"
+	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
+	"github.com/lf-edge/eve/pkg/pillar/utils/netutils"
 )
 
 // Uplink : uplink interface used by network instance for connectivity to outside networks.
@@ -51,7 +52,7 @@ func (u Uplink) Equal(other dg.Item) bool {
 		u.LogicalLabel == u2.LogicalLabel &&
 		u.MasterIfName == u2.MasterIfName &&
 		u.AdminUp == u2.AdminUp &&
-		utils.EqualSetsFn(u.IPAddresses, u2.IPAddresses, utils.EqualIPNets)
+		generics.EqualSetsFn(u.IPAddresses, u2.IPAddresses, netutils.EqualIPNets)
 }
 
 // External returns true - uplinks are physical interfaces, i.e. not created by zedrouter.
@@ -69,4 +70,11 @@ func (u Uplink) String() string {
 // Dependencies returns nothing (external item).
 func (u Uplink) Dependencies() (deps []dg.Dependency) {
 	return nil
+}
+
+// GetAssignedIPs returns IP addresses assigned to the uplink interface.
+// The function is needed for the definition of dependencies for
+// dnsmasq and HTTP server.
+func (u Uplink) GetAssignedIPs() []*net.IPNet {
+	return u.IPAddresses
 }

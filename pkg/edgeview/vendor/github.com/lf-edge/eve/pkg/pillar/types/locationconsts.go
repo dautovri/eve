@@ -11,7 +11,7 @@ const (
 
 	// PersistDir - Location to store persistent files.
 	PersistDir = "/persist"
-	// PersistConfigDir is where we keep some configuration across reboots
+	// PersistConfigDir is where we used to keep some configuration across reboots. Remove once upgradeconverter code is removed.
 	PersistConfigDir = PersistDir + "/config"
 	// PersistStatusDir is where we keep some configuration across reboots
 	PersistStatusDir = PersistDir + "/status"
@@ -31,6 +31,16 @@ const (
 	PersistInstallerDir = PersistDir + "/installer"
 	// IngestedDirname - location for shas of files we pulled from /config
 	IngestedDirname = PersistDir + "/ingested"
+	// SnapshotsDirname - location for snapshots
+	SnapshotsDirname = PersistDir + "/snapshots"
+	// SnapshotAppInstanceConfigFilename - file to store snapshot-related app instance config
+	SnapshotAppInstanceConfigFilename = "appInstanceConfig.json"
+	// SnapshotVolumesSnapshotStatusFilename - file to store volume snapshot status
+	SnapshotVolumesSnapshotStatusFilename = "volumesSnapshotStatus.json"
+	// SnapshotInstanceStatusFilename - file to store SnapshotInstanceStatus
+	SnapshotInstanceStatusFilename = "snapshotInstanceStatus.json"
+	// PersistCachePatchEnvelopes - folder to store inline patch envelopes
+	PersistCachePatchEnvelopes = PersistDir + "/patchEnvelopesCache"
 
 	// IdentityDirname - Config dir
 	IdentityDirname = "/config"
@@ -54,6 +64,8 @@ const (
 	APIV1FileName = IdentityDirname + "/Force-API-V1"
 	// BootstrapConfFileName - file to store initial device configuration for bootstrapping
 	BootstrapConfFileName = IdentityDirname + "/bootstrap-config.pb"
+	// RemoteAccessFlagFileName -- file to check for remote access configuration
+	RemoteAccessFlagFileName = IdentityDirname + "/remote_access_disabled"
 	// BootstrapShaFileName - file to store SHA hash of an already ingested bootstrap config
 	BootstrapShaFileName = IngestedDirname + "/bootstrap-config.sha"
 
@@ -102,12 +114,14 @@ var (
 	PersistDataset = strings.TrimLeft(PersistDir, "/")
 	// PersistPool - parent pool
 	PersistPool = PersistDataset
+	// ClearDataset - dataset which is not encrypted
+	ClearDataset = strings.TrimLeft(ClearDirName, "/")
 	// SealedDataset - dataset sealed under TPM PCRs
-	SealedDataset = PersistDataset + "/vault"
+	SealedDataset = strings.TrimLeft(SealedDirName, "/")
 	// PersistReservedDataset - reserved dataset
 	PersistReservedDataset = PersistDataset + "/reserved"
 	//VolumeClearZFSDataset - dataset to create volumes without encryption
-	VolumeClearZFSDataset = strings.TrimLeft(VolumeClearDirName, "/")
+	VolumeClearZFSDataset = ClearDataset + "/volumes"
 	//VolumeEncryptedZFSDataset - dataset to create volumes with encryption
-	VolumeEncryptedZFSDataset = strings.TrimLeft(VolumeEncryptedDirName, "/")
+	VolumeEncryptedZFSDataset = SealedDataset + "/volumes"
 )

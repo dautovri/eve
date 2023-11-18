@@ -34,9 +34,9 @@ import (
 
 	"github.com/eriknordmark/ipinfo"
 	"github.com/google/go-cmp/cmp"
-	"github.com/lf-edge/eve/api/go/attest"
-	"github.com/lf-edge/eve/api/go/flowlog"
-	"github.com/lf-edge/eve/api/go/info"
+	"github.com/lf-edge/eve-api/go/attest"
+	"github.com/lf-edge/eve-api/go/flowlog"
+	"github.com/lf-edge/eve-api/go/info"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
@@ -83,6 +83,7 @@ var cipherMetricsDL types.CipherMetrics
 var cipherMetricsDM types.CipherMetrics
 var cipherMetricsNim types.CipherMetrics
 var cipherMetricsZR types.CipherMetrics
+var cipherMetricsWwan types.CipherMetrics
 var diagMetrics types.MetricsMap
 var nimMetrics types.MetricsMap
 var zrouterMetrics types.MetricsMap
@@ -137,6 +138,7 @@ type zedagentContext struct {
 	subCapabilities           pubsub.Subscription
 	subAppInstMetaData        pubsub.Subscription
 	subWwanMetrics            pubsub.Subscription
+	subWwanStatus             pubsub.Subscription
 	subLocationInfo           pubsub.Subscription
 	subZFSPoolStatus          pubsub.Subscription
 	subZFSPoolMetrics         pubsub.Subscription
@@ -152,6 +154,8 @@ type zedagentContext struct {
 	subCipherMetricsDM        pubsub.Subscription
 	subCipherMetricsNim       pubsub.Subscription
 	subCipherMetricsZR        pubsub.Subscription
+	subCipherMetricsWwan      pubsub.Subscription
+	subPatchEnvelopeUsage     pubsub.Subscription
 	zedcloudMetrics           *zedcloud.AgentMetrics
 	fatalFlag                 bool // From command line arguments
 	hangFlag                  bool // From command line arguments
@@ -177,18 +181,21 @@ type zedagentContext struct {
 	//  This is the value of counter that triggered reboot. This is sent in
 	//  device info msg. Can be used to verify device is caught up on all
 	// outstanding reboot commands from cloud.
-	rebootConfigCounter     uint32
-	shutdownConfigCounter   uint32
-	subDevicePortConfigList pubsub.Subscription
-	DevicePortConfigList    *types.DevicePortConfigList
-	remainingTestTime       time.Duration
-	physicalIoAdapterMap    map[string]types.PhysicalIOAdapter
-	globalConfig            types.ConfigItemValueMap
-	globalConfigPublished   bool // was last globalConfig successfully published
-	specMap                 types.ConfigItemSpecMap
-	globalStatus            types.GlobalStatus
-	flowLogMetrics          types.FlowlogMetrics
-	appContainerStatsTime   time.Time // last time the App Container stats uploaded
+	rebootConfigCounter   uint32
+	shutdownConfigCounter uint32
+	// Part of the fields above (the reboot ones) are initialized only once the NodeAgent status is received
+	// This flag is used to make sure we initialize them before continuing with the rest of the agent's initialization
+	initializedFromNodeAgentStatus bool
+	subDevicePortConfigList        pubsub.Subscription
+	DevicePortConfigList           *types.DevicePortConfigList
+	remainingTestTime              time.Duration
+	physicalIoAdapterMap           map[string]types.PhysicalIOAdapter
+	globalConfig                   types.ConfigItemValueMap
+	globalConfigPublished          bool // was last globalConfig successfully published
+	specMap                        types.ConfigItemSpecMap
+	globalStatus                   types.GlobalStatus
+	flowLogMetrics                 types.FlowlogMetrics
+	appContainerStatsTime          time.Time // last time the App Container stats uploaded
 	// The MaintenanceMode can come from GlobalConfig and from the config
 	// API. Those are merged into maintenanceMode
 	// TBD will be also decide locally to go into maintenanceMode based
@@ -199,6 +206,12 @@ type zedagentContext struct {
 	apiMaintenanceMode   bool
 	localMaintenanceMode bool                        //maintenance mode triggered by local failure
 	localMaintModeReason types.MaintenanceModeReason //local failure reason for maintenance mode
+	devState             types.DeviceState
+	attestState          types.AttestState
+	attestError          string
+	vaultStatus          info.DataSecAtRestStatus
+	pcrStatus            info.PCRStatus
+	vaultErr             string
 
 	// Track the counter from force.fallback.counter to detect changes
 	forceFallbackCounter int
@@ -219,6 +232,7 @@ type zedagentContext struct {
 	netdumpInterval      time.Duration
 	lastConfigNetdumpPub time.Time // last call to publishConfigNetdump
 	lastInfoNetdumpPub   time.Time // last call to publishInfoNetdump
+	startTime            time.Time
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -256,7 +270,7 @@ func queueInfoToDest(ctx *zedagentContext, dest destinationBitset,
 	key string, buf *bytes.Buffer, size int64, bailOnHTTPErr,
 	withNetTracing, forcePeriodic bool, itemType interface{}) {
 
-	locConfig := ctx.getconfigCtx.locConfig
+	locConfig := ctx.getconfigCtx.sideController.locConfig
 
 	if dest&ControllerDest != 0 {
 		url := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API,
@@ -315,6 +329,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	zedagentCtx.ps = ps
 	zedagentCtx.hangFlag = *zedagentCtx.hangPtr
 	zedagentCtx.fatalFlag = *zedagentCtx.fatalPtr
+	zedagentCtx.startTime = time.Now()
 
 	flowlogQueue := make(chan *flowlog.FlowMessage, flowlogQueueCap)
 	triggerDeviceInfo := make(chan destinationBitset, 1)
@@ -390,14 +405,13 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	reinitNetdumper(zedagentCtx)
 
 	// We know our own UUID; prepare for communication with controller
-	zedcloudCtx = initZedcloudContext(
+	zedcloudCtx = initZedcloudContext(getconfigCtx,
 		zedagentCtx.globalConfig.GlobalValueInt(types.NetworkSendTimeout),
 		zedagentCtx.globalConfig.GlobalValueInt(types.NetworkDialTimeout),
 		zedagentCtx.zedcloudMetrics)
 
 	if parse != "" {
-		res, config := readValidateConfig(
-			types.DefaultConfigItemValueMap().GlobalValueInt(types.StaleConfigTime), parse)
+		res, config := readValidateConfig(parse)
 		if !res {
 			fmt.Printf("Failed to parse %s\n", parse)
 			return 1
@@ -427,6 +441,11 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	// With device UUID, zedagent is ready to initialize and activate all subscriptions.
 	initPostOnboardSubs(zedagentCtx)
+
+	// Wait until we initialize the context from node agent status.
+	// At least we need to be sure the bootReason field is set properly, as it's used during fetching local config,
+	// when it's necessary (necessary or not is determined exactly by the bootReason).
+	waitUntilInitializedFromNodeAgentStatus(zedagentCtx, stillRunning)
 
 	//initialize cipher processing block
 	cipherModuleInitialize(zedagentCtx)
@@ -477,7 +496,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	getconfigCtx.locationAppTickerHandle = <-handleChannel
 
 	//trigger channel for localProfile state machine
-	getconfigCtx.localProfileTrigger = make(chan Notify, 1)
+	getconfigCtx.sideController.localProfileTrigger = make(chan Notify, 1)
 	//process saved local profile
 	processSavedProfile(getconfigCtx)
 
@@ -517,6 +536,19 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	return 0
 }
 
+func waitUntilInitializedFromNodeAgentStatus(ctx *zedagentContext, running *time.Ticker) {
+	log.Functionf("waitUntilInitializedFromNodeAgentStatus()")
+	for !ctx.initializedFromNodeAgentStatus {
+		select {
+		case change := <-ctx.getconfigCtx.subNodeAgentStatus.MsgChan():
+			ctx.getconfigCtx.subNodeAgentStatus.ProcessChange(change)
+		case <-running.C:
+		}
+		ctx.ps.StillRunning(agentName, warningTime, errorTime)
+	}
+	log.Functionf("waitUntilInitializedFromNodeAgentStatus() done")
+}
+
 func (zedagentCtx *zedagentContext) init() {
 	zedagentCtx.zedcloudMetrics = zedcloud.NewAgentMetrics()
 	zedagentCtx.specMap = types.NewConfigItemSpecMap()
@@ -551,13 +583,13 @@ func (zedagentCtx *zedagentContext) init() {
 
 	// Initialize context used to get and parse device configuration.
 	getconfigCtx := &getconfigContext{
-		localServerMap: &localServerMap{},
 		// default value of currentMetricInterval
 		currentMetricInterval: zedagentCtx.globalConfig.GlobalValueInt(types.MetricInterval),
 		// edge-view configure
 		configEdgeview: &types.EdgeviewConfig{},
 		cipherContexts: make(map[string]types.CipherContext),
 	}
+	getconfigCtx.sideController.localServerMap = &localServerMap{}
 
 	cipherCtx := &cipherContext{}
 	attestCtx := &attestContext{}
@@ -708,8 +740,11 @@ func waitUntilDNSReady(zedagentCtx *zedagentContext, stillRunning *time.Ticker) 
 			zedagentCtx.subEncryptedKeyFromDevice.ProcessChange(change)
 
 		case change := <-getconfigCtx.subAppNetworkStatus.MsgChan():
-			getconfigCtx.localServerMap.upToDate = false
+			getconfigCtx.sideController.localServerMap.upToDate = false
 			getconfigCtx.subAppNetworkStatus.ProcessChange(change)
+
+		case change := <-zedagentCtx.subWwanStatus.MsgChan():
+			zedagentCtx.subWwanStatus.ProcessChange(change)
 
 		case change := <-zedagentCtx.subWwanMetrics.MsgChan():
 			zedagentCtx.subWwanMetrics.ProcessChange(change)
@@ -776,7 +811,7 @@ func mainEventLoop(zedagentCtx *zedagentContext, stillRunning *time.Ticker) {
 			getconfigCtx.subNodeAgentStatus.ProcessChange(change)
 
 		case change := <-getconfigCtx.subAppNetworkStatus.MsgChan():
-			getconfigCtx.localServerMap.upToDate = false
+			getconfigCtx.sideController.localServerMap.upToDate = false
 			getconfigCtx.subAppNetworkStatus.ProcessChange(change)
 
 		case change := <-dnsCtx.subDeviceNetworkStatus.MsgChan():
@@ -928,6 +963,15 @@ func mainEventLoop(zedagentCtx *zedagentContext, stillRunning *time.Ticker) {
 				cipherMetricsZR = m.(types.CipherMetrics)
 			}
 
+		case change := <-zedagentCtx.subCipherMetricsWwan.MsgChan():
+			zedagentCtx.subCipherMetricsWwan.ProcessChange(change)
+			m, err := zedagentCtx.subCipherMetricsWwan.Get("global")
+			if err != nil {
+				log.Errorf("subCipherMetricsWwan.Get failed: %s", err)
+			} else {
+				cipherMetricsWwan = m.(types.CipherMetrics)
+			}
+
 		case change := <-zedagentCtx.subNetworkInstanceStatus.MsgChan():
 			zedagentCtx.subNetworkInstanceStatus.ProcessChange(change)
 
@@ -971,6 +1015,9 @@ func mainEventLoop(zedagentCtx *zedagentContext, stillRunning *time.Ticker) {
 		case change := <-zedagentCtx.subAppInstMetaData.MsgChan():
 			zedagentCtx.subAppInstMetaData.ProcessChange(change)
 
+		case change := <-zedagentCtx.subWwanStatus.MsgChan():
+			zedagentCtx.subWwanStatus.ProcessChange(change)
+
 		case change := <-zedagentCtx.subWwanMetrics.MsgChan():
 			zedagentCtx.subWwanMetrics.ProcessChange(change)
 
@@ -983,6 +1030,15 @@ func mainEventLoop(zedagentCtx *zedagentContext, stillRunning *time.Ticker) {
 
 		case change := <-zedagentCtx.subZFSPoolMetrics.MsgChan():
 			zedagentCtx.subZFSPoolMetrics.ProcessChange(change)
+
+		case change := <-getconfigCtx.subCachedResolvedIPs.MsgChan():
+			getconfigCtx.subCachedResolvedIPs.ProcessChange(change)
+
+		case change := <-getconfigCtx.subPatchEnvelopeStatus.MsgChan():
+			getconfigCtx.subPatchEnvelopeStatus.ProcessChange(change)
+
+		case change := <-zedagentCtx.subPatchEnvelopeUsage.MsgChan():
+			zedagentCtx.subPatchEnvelopeUsage.ProcessChange(change)
 
 		case <-hwInfoTiker.C:
 			triggerPublishHwInfo(zedagentCtx)
@@ -1163,6 +1219,16 @@ func initPublications(zedagentCtx *zedagentContext) {
 	}
 	getconfigCtx.pubEdgeNodeInfo.ClearRestarted()
 
+	getconfigCtx.pubPatchEnvelopeInfo, err = ps.NewPublication(
+		pubsub.PublicationOptions{
+			AgentName:  agentName,
+			TopicType:  types.PatchEnvelopeInfoList{},
+			Persistent: true,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	getconfigCtx.pubPatchEnvelopeInfo.ClearRestarted()
 }
 
 // All but one zedagent subscription (subOnboardStatus) are activated
@@ -1649,8 +1715,24 @@ func initPostOnboardSubs(zedagentCtx *zedagentContext) {
 	}
 	zedagentCtx.subAppInstMetaData.Activate()
 
+	// Used to publish info about unused cellular modems.
+	// Cellular modems used by configured network ports have status published
+	// as part of DeviceNetworkStatus.
+	zedagentCtx.subWwanStatus, err = ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "wwan",
+		MyAgentName: agentName,
+		TopicImpl:   types.WwanStatus{},
+		Activate:    true,
+		Ctx:         zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	zedagentCtx.subWwanMetrics, err = ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "nim",
+		AgentName:   "wwan",
 		MyAgentName: agentName,
 		TopicImpl:   types.WwanMetrics{},
 		Activate:    true,
@@ -1663,7 +1745,7 @@ func initPostOnboardSubs(zedagentCtx *zedagentContext) {
 	}
 
 	zedagentCtx.subLocationInfo, err = ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "nim",
+		AgentName:   "wwan",
 		MyAgentName: agentName,
 		TopicImpl:   types.WwanLocationInfo{},
 		Activate:    true,
@@ -1798,6 +1880,17 @@ func initPostOnboardSubs(zedagentCtx *zedagentContext) {
 		log.Fatal(err)
 	}
 
+	zedagentCtx.subCipherMetricsWwan, err = ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "wwan",
+		MyAgentName: agentName,
+		TopicImpl:   types.CipherMetrics{},
+		Activate:    true,
+		Ctx:         zedagentCtx,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	zedagentCtx.subZFSPoolStatus, err = ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:   "zfsmanager",
 		MyAgentName: agentName,
@@ -1819,6 +1912,42 @@ func initPostOnboardSubs(zedagentCtx *zedagentContext) {
 		Ctx:         &zedagentCtx,
 		WarningTime: warningTime,
 		ErrorTime:   errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	getconfigCtx.subCachedResolvedIPs, err = ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "nim",
+		MyAgentName: agentName,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+		TopicImpl:   types.CachedResolvedIPs{},
+		Activate:    true,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedagentCtx.subPatchEnvelopeUsage, err = ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:   "zedrouter",
+		MyAgentName: agentName,
+		TopicImpl:   types.PatchEnvelopeUsage{},
+		Activate:    true,
+		Ctx:         &zedagentCtx,
+		WarningTime: warningTime,
+		ErrorTime:   errorTime,
+	})
+
+	getconfigCtx.subPatchEnvelopeStatus, err = ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "zedrouter",
+		MyAgentName:   agentName,
+		TopicImpl:     types.PatchEnvelopeInfo{},
+		Activate:      true,
+		Ctx:           zedagentCtx,
+		CreateHandler: handlePatchEnvelopeStatusCreate,
+		ModifyHandler: handlePatchEnvelopeStatusModify,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -2324,6 +2453,8 @@ func handleNodeAgentStatusImpl(ctxArg interface{}, key string,
 	ctx.bootReason = status.BootReason
 	ctx.restartCounter = status.RestartCounter
 	ctx.allDomainsHalted = status.AllDomainsHalted
+	// Mark that we have received the NodeAgentStatus and initialized the context properly
+	ctx.initializedFromNodeAgentStatus = true
 	// if config reboot command was initiated and
 	// was deferred, and the device is not in inprogress
 	// state, initiate the reboot process
@@ -2434,6 +2565,13 @@ func getDeferredSentHandlerFunction(ctx *zedagentContext) *zedcloud.SentHandlerF
 				case types.SenderStatusNotFound:
 					log.Functionf("sendAttestReqProtobuf: Controller SenderStatusNotFound")
 					potentialUUIDUpdate(ctx.getconfigCtx)
+				}
+				if !ctx.publishedEdgeNodeCerts {
+					// Attestation request does not clog the send queue (issued
+					// with the `ignoreErr` set to true), but once fails has to
+					// be repeated in reasonable time to avoid tight fail-repeat
+					// loop.
+					triggerEdgeNodeCertDelayedEvent(ctx, 10*time.Second)
 				}
 			}
 		}

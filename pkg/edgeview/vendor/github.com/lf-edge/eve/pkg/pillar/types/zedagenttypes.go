@@ -6,36 +6,32 @@ package types
 import (
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve-api/go/info"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	uuid "github.com/satori/go.uuid"
 )
 
-// This is what we assume will come from the ZedControl for base OS.
-// Note that we can have different versions  configured for the
-// same UUID, hence the key is the UUIDandVersion  We assume the
-// elements in ContentTreeConfig should be installed, but activation
+// BaseOsConfig is what we assume will come from the ZedControl for base OS.
+// We assume ContentTreeUUID should be installed, but activation
 // is driven by the Activate attribute.
-
 type BaseOsConfig struct {
-	UUIDandVersion        UUIDandVersion
-	BaseOsVersion         string // From GetShortVersion
-	ContentTreeConfigList []ContentTreeConfig
-	RetryCount            int32
-	Activate              bool
+	BaseOsVersion      string
+	ContentTreeUUID    string
+	RetryUpdateCounter uint32
+	Activate           bool
 }
 
 func (config BaseOsConfig) Key() string {
-	return config.UUIDandVersion.UUID.String()
+	return config.ContentTreeUUID
 }
 
 // LogCreate :
 func (config BaseOsConfig) LogCreate(logBase *base.LogObject) {
 	logObject := base.NewLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
-		config.UUIDandVersion.UUID, config.LogKey())
+		nilUUID, config.LogKey())
 	if logObject == nil {
 		return
 	}
@@ -46,7 +42,7 @@ func (config BaseOsConfig) LogCreate(logBase *base.LogObject) {
 // LogModify :
 func (config BaseOsConfig) LogModify(logBase *base.LogObject, old interface{}) {
 	logObject := base.EnsureLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
-		config.UUIDandVersion.UUID, config.LogKey())
+		nilUUID, config.LogKey())
 
 	oldConfig, ok := old.(BaseOsConfig)
 	if !ok {
@@ -68,7 +64,7 @@ func (config BaseOsConfig) LogModify(logBase *base.LogObject, old interface{}) {
 // LogDelete :
 func (config BaseOsConfig) LogDelete(logBase *base.LogObject) {
 	logObject := base.EnsureLogObject(logBase, base.BaseOsConfigLogType, config.BaseOsVersion,
-		config.UUIDandVersion.UUID, config.LogKey())
+		nilUUID, config.LogKey())
 	logObject.CloneAndAddField("activate", config.Activate).
 		Noticef("BaseOs config delete")
 
@@ -80,16 +76,15 @@ func (config BaseOsConfig) LogKey() string {
 	return string(base.BaseOsConfigLogType) + "-" + config.BaseOsVersion
 }
 
-// Indexed by UUIDandVersion as above
+// BaseOsStatus indexed by ContentTreeUUID as above
 type BaseOsStatus struct {
-	UUIDandVersion        UUIDandVersion
-	BaseOsVersion         string
-	Activated             bool
-	TooEarly              bool // Failed since previous was inprogress/test
-	ContentTreeStatusList []ContentTreeStatus
-	PartitionLabel        string
-	PartitionDevice       string // From zboot
-	PartitionState        string // From zboot
+	BaseOsVersion   string
+	Activated       bool
+	TooEarly        bool // Failed since previous was inprogress/test
+	ContentTreeUUID string
+	PartitionLabel  string
+	PartitionDevice string // From zboot
+	PartitionState  string // From zboot
 	// Minimum state across all steps/StorageStatus.
 	// Error* set implies error.
 	State SwState
@@ -99,13 +94,13 @@ type BaseOsStatus struct {
 }
 
 func (status BaseOsStatus) Key() string {
-	return status.UUIDandVersion.UUID.String()
+	return status.ContentTreeUUID
 }
 
 // LogCreate :
 func (status BaseOsStatus) LogCreate(logBase *base.LogObject) {
 	logObject := base.NewLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
-		status.UUIDandVersion.UUID, status.LogKey())
+		nilUUID, status.LogKey())
 	if logObject == nil {
 		return
 	}
@@ -116,7 +111,7 @@ func (status BaseOsStatus) LogCreate(logBase *base.LogObject) {
 // LogModify :
 func (status BaseOsStatus) LogModify(logBase *base.LogObject, old interface{}) {
 	logObject := base.EnsureLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
-		status.UUIDandVersion.UUID, status.LogKey())
+		nilUUID, status.LogKey())
 
 	oldStatus, ok := old.(BaseOsStatus)
 	if !ok {
@@ -145,7 +140,7 @@ func (status BaseOsStatus) LogModify(logBase *base.LogObject, old interface{}) {
 // LogDelete :
 func (status BaseOsStatus) LogDelete(logBase *base.LogObject) {
 	logObject := base.EnsureLogObject(logBase, base.BaseOsStatusLogType, status.BaseOsVersion,
-		status.UUIDandVersion.UUID, status.LogKey())
+		nilUUID, status.LogKey())
 	logObject.CloneAndAddField("state", status.State.String()).
 		Noticef("BaseOs status delete")
 
@@ -264,7 +259,7 @@ const (
 	BootReasonOOM                // OOM causing process to be killed
 	BootReasonWatchdogHung       // Software watchdog due stuck agent
 	BootReasonWatchdogPid        // Software watchdog due to e.g., golang panic
-	BootReasonKernel             // TBD how we detect this
+	BootReasonKernel             // Set by dump-capture kernel, see docs/KERNEL-DUMPS.md and pkg/kdump/kdump.sh for details
 	BootReasonPowerFail          // Known power failure e.g., from disk controller S.M.A.R.T counter increase
 	BootReasonUnknown            // Could be power failure, kernel panic, or hardware watchdog
 	BootReasonVaultFailure       // Vault was not ready within the expected time
@@ -433,6 +428,7 @@ type NodeAgentStatus struct {
 	RebootImage                string
 	LocalMaintenanceMode       bool                  //enter Maintenance Mode
 	LocalMaintenanceModeReason MaintenanceModeReason //reason for Maintenance Mode
+	HVTypeKube                 bool
 }
 
 // Key :
@@ -489,7 +485,7 @@ const (
 	ConfigGetReadSaved
 )
 
-//DeviceOperation is an operation on device
+// DeviceOperation is an operation on device
 type DeviceOperation uint8
 
 const (
@@ -528,6 +524,57 @@ type ZedAgentStatus struct {
 	ForceFallbackCounter  int          // Try image fallback when counter changes
 	CurrentProfile        string       // Current profile
 	RadioSilence          RadioSilence // Currently requested state of radio devices
+	DeviceState           DeviceState
+	AttestState           AttestState
+	AttestError           string
+	VaultStatus           info.DataSecAtRestStatus
+	PCRStatus             info.PCRStatus
+	VaultErr              string
+}
+
+// DeviceState represents overall state
+type DeviceState uint8
+
+// Integer values must match those in ZDeviceState in lf-edge/eve-api/proto/info/info.proto
+//
+//revive:disable:var-naming
+const (
+	DEVICE_STATE_UNSPECIFIED        DeviceState = iota
+	DEVICE_STATE_ONLINE                         = 1
+	DEVICE_STATE_REBOOTING                      = 2
+	DEVICE_STATE_MAINTENANCE_MODE               = 3
+	DEVICE_STATE_BASEOS_UPDATING                = 4
+	DEVICE_STATE_BOOTING                        = 5
+	DEVICE_STATE_PREPARING_POWEROFF             = 6
+	DEVICE_STATE_POWERING_OFF                   = 7
+	DEVICE_STATE_PREPARED_POWEROFF              = 8
+)
+
+//revive:enable:var-naming
+
+func (ds DeviceState) String() string {
+	switch ds {
+	case DEVICE_STATE_UNSPECIFIED:
+		return "unspecified"
+	case DEVICE_STATE_ONLINE:
+		return "online"
+	case DEVICE_STATE_REBOOTING:
+		return "rebooting"
+	case DEVICE_STATE_MAINTENANCE_MODE:
+		return "maintenance_mode"
+	case DEVICE_STATE_BASEOS_UPDATING:
+		return "baseos_updating"
+	case DEVICE_STATE_BOOTING:
+		return "booting"
+	case DEVICE_STATE_PREPARING_POWEROFF:
+		return "preparing_poweroff"
+	case DEVICE_STATE_POWERING_OFF:
+		return "powering_off"
+	case DEVICE_STATE_PREPARED_POWEROFF:
+		return "prepared_poweroff"
+	default:
+		return fmt.Sprintf("Unknown state %d", ds)
+	}
 }
 
 // Key :
@@ -585,12 +632,6 @@ type BaseOSMgrStatus struct {
 	CurrentRetryUpdateCounter uint32 // CurrentRetryUpdateCounter from baseosmgr
 }
 
-// BaseOs : copy of zconfig.BaseOS
-type BaseOs struct {
-	ContentTreeUUID          string
-	ConfigRetryUpdateCounter uint32
-}
-
 // RadioSilence : used in ZedAgentStatus to record the *requested* state of radio devices.
 // Also used in DeviceNetworkStatus to publish the *actual* state of radios.
 // InProgress is used to wait for the operation changing the radio state
@@ -638,7 +679,6 @@ func (am RadioSilence) String() string {
 
 // LocalCommands : commands triggered locally via Local profile server.
 type LocalCommands struct {
-	sync.Mutex
 	// Locally issued app commands.
 	// For every app there is entry only for the last command (completed
 	// or still in progress). Previous commands are not remembered.
@@ -667,7 +707,6 @@ const (
 	AppCommandRestart
 	// AppCommandPurge : purge application with ALL of its volumes.
 	AppCommandPurge
-	// TODO : purge for a single or a subset of volumes.
 )
 
 // LocalAppCommand : An application command requested from a local server.
@@ -707,3 +746,9 @@ const (
 	// DevCommandShutdownPoweroff : shut down all app instances + poweroff
 	DevCommandShutdownPoweroff
 )
+
+// LOCConfig : configuration of the Local Operator Console
+type LOCConfig struct {
+	// LOC URL
+	LocURL string
+}

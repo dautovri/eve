@@ -12,7 +12,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/lf-edge/eve/libs/zedUpload"
+	"github.com/lf-edge/eve-libs/zedUpload"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
@@ -135,8 +135,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case change := <-ctx.subDeviceNetworkStatus.MsgChan():
 			ctx.subDeviceNetworkStatus.ProcessChange(change)
 
-		case change := <-ctx.decryptCipherContext.SubEdgeNodeCert.MsgChan():
-			ctx.decryptCipherContext.SubEdgeNodeCert.ProcessChange(change)
+		case change := <-ctx.subEdgeNodeCert.MsgChan():
+			ctx.subEdgeNodeCert.ProcessChange(change)
 			log.Noticef("Processed EdgeNodeCert")
 
 		// This wait can take an unbounded time since we wait for IP
@@ -157,12 +157,12 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	for {
 		select {
-		case change := <-ctx.decryptCipherContext.SubControllerCert.MsgChan():
-			ctx.decryptCipherContext.SubControllerCert.ProcessChange(change)
+		case change := <-ctx.subControllerCert.MsgChan():
+			ctx.subControllerCert.ProcessChange(change)
 			log.Noticef("Processed ControllerCert")
 
-		case change := <-ctx.decryptCipherContext.SubEdgeNodeCert.MsgChan():
-			ctx.decryptCipherContext.SubEdgeNodeCert.ProcessChange(change)
+		case change := <-ctx.subEdgeNodeCert.MsgChan():
+			ctx.subEdgeNodeCert.ProcessChange(change)
 			log.Noticef("Processed EdgeNodeCert")
 
 		case change := <-ctx.subGlobalConfig.MsgChan():

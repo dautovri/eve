@@ -11,6 +11,7 @@ import (
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/nireconciler/genericitems"
+	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 )
 
@@ -31,7 +32,7 @@ func init() {
 
 func exampleDnsmasqParams() genericitems.Dnsmasq {
 	var dnsmasq genericitems.Dnsmasq
-	dnsmasq.InstanceName = "br0"
+	dnsmasq.ForNI, _ = uuid.FromString("d882ce20-fac2-448b-82e6-d411619d488f")
 	dnsmasq.ListenIf.IfName = "br0"
 	_, subnet, _ := net.ParseCIDR("10.0.0.0/24")
 	dnsmasq.DHCPServer = genericitems.DHCPServer{
@@ -58,14 +59,14 @@ func exampleDnsmasqParams() genericitems.Dnsmasq {
 			IfName: "eth0",
 		},
 		UpstreamServers: []net.IP{{1, 1, 1, 1}, {141, 1, 1, 1}, {208, 67, 220, 220}},
-		StaticEntries: []genericitems.HostnameToIP{
+		StaticEntries: []genericitems.HostnameToIPs{
 			{
 				Hostname: "router",
-				IP:       net.IP{10, 0, 0, 1},
+				IPs:      []net.IP{{10, 0, 0, 1}},
 			},
 			{
 				Hostname: "app1",
-				IP:       net.IP{10, 0, 0, 5},
+				IPs:      []net.IP{{10, 0, 0, 5}},
 			},
 		},
 		LinuxIPSets: []genericitems.LinuxIPSet{

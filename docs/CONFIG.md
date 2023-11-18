@@ -13,6 +13,7 @@ In general, EVE is trying to make sure that its controller always has the last w
 * `wpa_supplicant.conf` - a legacy way of configuring EVE's WiFi
 * `authorized_keys` - initial authorized SSH keys for accessing EVE's debug console; DO NOT use options, we only accept 'keytype, base64-encoded key, comment' format
 * `bootstrap-config.pb`- initial device configuration used only until device is onboarded (see below for details)
+* `remote_access_disabled`- a file indicating remote access status, if it exist remote access (edge-view and ssh) is disabled. Please check [config document](SECURITY.md#disabling-remote-access) for more information.
 
 The initial content of these configuration files is stored in the EVE's source tree under [config](../config) folder. From there, these configuration files are baked into the EVE installer images. For the read-write bootable disk installer image these files can further be tweaked by mounting the "EVE" partition and editing those files directly on the installer image. This gives you an ability to take the default installer image and tweak it for your needs without re-building EVE from scratch (obviously this is not an option for a read-only ISO installer image). A typical workflow is to take an installer image from the official EVE build, flash it onto a USB flash drive, insert that USB flash drive into your desktop and edit file on the partition called EVE.
 
@@ -26,7 +27,7 @@ Normally, this trusted source happens to be EVE's controller and the trust is es
 However, in some scenarios, device might not be able to establish the initial controller connectivity using the default network configuration (for definition see "Last Resort" section in [DEVICE-CONNECTIVITY.md](./DEVICE-CONNECTIVITY.md)). For example, the network to which the device is connected may require that all traffic goes through a network proxy, otherwise it is blocked. Or the network may use static IP settings without providing DHCP service, expecting every endpoint to select and configure an appropriate IP address on its own. Or maybe device has only LTE connectivity and needs to know what APN to register into the network with.
 In such cases it is required to deliver the initial, also known as *bootstrap*, device configuration off-line. The recommended method (over some legacy mechanisms described below) is to prepare a single-use EVE installation medium, carrying the bootstrap config for the target device inside the EVE partition.
 
-The bootstrap configuration is modeled using the same Protobuf message that models device configuration delivered on-line: [EdgeDevConfig](../api/proto/config/devconfig.proto). Just like in the on-line config delivery, an instance of `EdgeDevConfig` is protobuf-encoded and put into the `AuthContainer` envelope alongside a signature (see [OBJECT-SIGNING.md](../api/OBJECT-SIGNING.md)). For the off-line signature verification (that must pass for the device to accept the configuration), it is necessary to further wrap `AuthContainer` together with the signing and all intermediary controller certificates inside [BootstrapConfig](../api/proto/config/devconfig.proto). Finally, `BootstrapConfig` should be protobuf-encoded and written in this binary format into the EVE partition of a single-use EVE installer as `bootstrap-config.pb`. During the EVE installation, this file is copied into the CONFIG partition.
+The bootstrap configuration is modeled using the same Protobuf message that models device configuration delivered on-line: [EdgeDevConfig](https://github.com/lf-edge/eve-api/tree/main/proto/config/devconfig.proto). Just like in the on-line config delivery, an instance of EdgeDevConfig is protobuf-encoded, signed and possibly encrypted inside AuthContainer (see [OBJECT-SIGNING.md](https://github.com/lf-edge/eve-api/tree/main/OBJECT-SIGNING.md)). For the off-line signature verification (that must pass for the device to accept the configuration), it is necessary to further wrap `AuthContainer` together with the signing and all intermediary controller certificates inside [BootstrapConfig](https://github.com/lf-edge/eve-api/tree/main/proto/config/devconfig.proto). Finally, `BootstrapConfig` should be protobuf-encoded and written in this binary format into the EVE partition of a single-use EVE installer as `bootstrap-config.pb`. During the EVE installation, this file is copied into the CONFIG partition.
 
 The format of the bootstrap configuration is rather complex and intentionally binary to disincentivise users from preparing and editing the configuration manually. Instead, it is expected that the process of preparing and exporting the bootstrap configuration is done by the controller and the tools that it provides. To bake an exported bootstrap config into a single-use EVE installer, use [eve-gen-single-use-installer.sh](../tools/eve-gen-single-use-installer.sh) script (run with no arguments to print the script usage).
 
@@ -184,7 +185,8 @@ An example file with eth0 being static and eth1 using dhcp is:
 }
 ```
 
-To specify that wwan0 should be secondary (only used if eth0 can not be used to reach the controller), and eth1 only be if neither eth0 nor wwan0 works, one would set non-zero costs. For example,
+To specify that a cellular modem should be secondary (only used if eth0 can not be used to reach the controller),
+and eth1 only be used if neither eth0 nor the modem works, one would set non-zero costs. For example,
 
 ```json
 {
@@ -201,10 +203,23 @@ To specify that wwan0 should be secondary (only used if eth0 can not be used to 
         {
             "Dhcp": 4,
             "Cost": 1,
-            "IfName": "wwan0",
+            "USBAddr": "1:1.4",
+            "PCIAddr": "0000:01:00.0",
             "IsMgmt": true,
-            "Name": "Management1"
-        }
+            "Name": "Management1",
+            "WirelessCfg": {
+                "WType": 1,
+                "CellularV2": {
+                    "AccessPoints": [
+                        {
+                            "SIMSlot": 0,
+                            "Activated": true,
+                            "APN": "internet"
+                        }
+                    ]
+                }
+            }
+        },
         {
             "Dhcp": 4,
             "Cost": 2,

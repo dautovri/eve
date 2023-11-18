@@ -16,9 +16,9 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 
-	"github.com/lf-edge/eve/api/go/evecommon"
-	dg "github.com/lf-edge/eve/libs/depgraph"
-	"github.com/lf-edge/eve/libs/reconciler"
+	"github.com/lf-edge/eve-api/go/evecommon"
+	dg "github.com/lf-edge/eve-libs/depgraph"
+	"github.com/lf-edge/eve-libs/reconciler"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	dpcrec "github.com/lf-edge/eve/pkg/pillar/dpcreconciler"
 	generic "github.com/lf-edge/eve/pkg/pillar/dpcreconciler/genericitems"
@@ -195,8 +195,8 @@ func TestSingleEthInterface(test *testing.T) {
 				IsMgmt:       true,
 				IsL3Port:     true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 			},
 		},
@@ -390,8 +390,8 @@ func TestMultipleEthsSameSubnet(test *testing.T) {
 				IsMgmt:       true,
 				IsL3Port:     true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 			},
 			{
@@ -401,8 +401,8 @@ func TestMultipleEthsSameSubnet(test *testing.T) {
 				IsMgmt:       true,
 				IsL3Port:     true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 			},
 		},
@@ -563,8 +563,8 @@ func TestWireless(test *testing.T) {
 				IsMgmt:       true,
 				IsL3Port:     true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 				WirelessCfg: types.WirelessConfig{
 					WType: types.WirelessTypeWifi,
@@ -579,20 +579,23 @@ func TestWireless(test *testing.T) {
 				},
 			},
 			{
-				IfName:       "wwan0",
+				USBAddr:      "3:7.4",
 				Phylabel:     "wwan0",
 				Logicallabel: "mock-wwan0",
 				IsMgmt:       true,
 				IsL3Port:     true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 				WirelessCfg: types.WirelessConfig{
 					WType: types.WirelessTypeCellular,
-					Cellular: []types.CellConfig{
-						{
-							APN: "my-apn",
+					CellularV2: types.CellNetPortConfig{
+						AccessPoints: []types.CellularAccessPoint{
+							{
+								APN:       "my-apn",
+								Activated: true,
+							},
 						},
 					},
 				},
@@ -619,7 +622,7 @@ func TestWireless(test *testing.T) {
 				Logicallabel: "mock-wwan0",
 				Usage:        evecommon.PhyIoMemberUsage_PhyIoUsageMgmtAndApps,
 				Cost:         0,
-				Ifname:       "wwan0",
+				UsbAddr:      "3:7.4",
 				MacAddr:      wwan0Mac,
 				IsPCIBack:    false,
 				IsPort:       true,
@@ -641,10 +644,25 @@ func TestWireless(test *testing.T) {
 	t.Expect(itemDescription(wlan)).ToNot(ContainSubstring("my-password"))
 	t.Expect(itemDescription(wlan)).To(ContainSubstring("enable RF: true"))
 	wwan := dg.Reference(generic.Wwan{})
-	t.Expect(itemDescription(wwan)).To(ContainSubstring("Apns:[my-apn]"))
-	t.Expect(itemDescription(wwan)).To(ContainSubstring("Interface:wwan0"))
+	t.Expect(itemDescription(wwan)).To(ContainSubstring(fmt.Sprintf("Timestamp:%v", dpc.TimePriority)))
+	t.Expect(itemDescription(wwan)).To(ContainSubstring("SIMSlot:0"))
+	t.Expect(itemDescription(wwan)).To(ContainSubstring("APN:my-apn"))
+	t.Expect(itemDescription(wwan)).To(ContainSubstring("PhysAddrs:{Interface: USB:3:7.4 PCI: Dev:}"))
 	t.Expect(itemDescription(wwan)).To(ContainSubstring("LogicalLabel:mock-wwan0"))
 	t.Expect(itemDescription(wwan)).To(ContainSubstring("RadioSilence:false"))
+	t.Expect(itemCountWithType(generic.IOHandleTypename)).To(Equal(1))
+	t.Expect(itemCountWithType(generic.AdapterTypename)).To(Equal(1))
+	t.Expect(itemCountWithType(generic.AdapterAddrsTypename)).To(Equal(1))
+	t.Expect(itemCountWithType(generic.DhcpcdTypename)).To(Equal(1))
+	t.Expect(itemCountWithType(generic.IPv4RouteTypename)).To(Equal(0))
+	t.Expect(itemCountWithType(generic.ArpTypename)).To(Equal(0))
+
+	// Simulate that DPC Manager learnt the wwan interface name.
+	dpc.Ports = []types.NetworkPortConfig{dpc.Ports[0], dpc.Ports[1]} // copy
+	dpc.Ports[1].IfName = "wwan0"
+	ctx = reconciler.MockRun(context.Background())
+	status = dpcReconciler.Reconcile(ctx, dpcrec.Args{GCP: *gcp, DPC: dpc, AA: aa})
+	t.Expect(status.Error).To(BeNil())
 	t.Expect(itemCountWithType(generic.IOHandleTypename)).To(Equal(2))
 	t.Expect(itemCountWithType(generic.AdapterTypename)).To(Equal(2))
 	t.Expect(itemCountWithType(generic.AdapterAddrsTypename)).To(Equal(2))
@@ -667,6 +685,7 @@ func TestWireless(test *testing.T) {
 	t.Expect(status.RS.ConfigError).To(BeEmpty())
 	t.Expect(itemDescription(wlan)).To(ContainSubstring("enable RF: false"))
 	t.Expect(itemDescription(wwan)).To(ContainSubstring("RadioSilence:true"))
+	t.Expect(itemDescription(wwan)).To(ContainSubstring(fmt.Sprintf("Timestamp:%v", rsTimestamp)))
 	t.Expect(itemCountWithType(generic.IOHandleTypename)).To(Equal(2))
 	t.Expect(itemCountWithType(generic.AdapterTypename)).To(Equal(2))
 	t.Expect(itemCountWithType(generic.AdapterAddrsTypename)).To(Equal(2))
@@ -742,8 +761,8 @@ func TestVlansAndBonds(test *testing.T) {
 				IsL3Port:     true,
 				IsMgmt:       true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 				L2LinkConfig: types.L2LinkConfig{
 					L2Type: types.L2LinkTypeVLAN,
@@ -759,8 +778,8 @@ func TestVlansAndBonds(test *testing.T) {
 				IsL3Port:     true,
 				IsMgmt:       true,
 				DhcpConfig: types.DhcpConfig{
-					Dhcp: types.DT_CLIENT,
-					Type: types.NT_IPV4,
+					Dhcp: types.DhcpTypeClient,
+					Type: types.NetworkTypeIPv4,
 				},
 				L2LinkConfig: types.L2LinkConfig{
 					L2Type: types.L2LinkTypeVLAN,

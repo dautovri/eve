@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"net"
 
-	dg "github.com/lf-edge/eve/libs/depgraph"
+	dg "github.com/lf-edge/eve-libs/depgraph"
 	"github.com/lf-edge/eve/pkg/pillar/base"
-	"github.com/lf-edge/eve/pkg/pillar/utils"
+	"github.com/lf-edge/eve/pkg/pillar/nireconciler/genericitems"
+	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
+	"github.com/lf-edge/eve/pkg/pillar/utils/netutils"
 	"github.com/vishvananda/netlink"
 )
 
@@ -54,7 +56,7 @@ func (b Bridge) Equal(other dg.Item) bool {
 	return b.IfName == b2.IfName &&
 		b.CreatedByNIM == b2.CreatedByNIM &&
 		bytes.Equal(b.MACAddress, b2.MACAddress) &&
-		utils.EqualSetsFn(b.IPAddresses, b2.IPAddresses, utils.EqualIPNets)
+		generics.EqualSetsFn(b.IPAddresses, b2.IPAddresses, netutils.EqualIPNets)
 }
 
 // External returns true if it was created by NIM and not be zedrouter.
@@ -69,9 +71,33 @@ func (b Bridge) String() string {
 		b.MACAddress, b.IPAddresses)
 }
 
-// Dependencies returns no dependencies.
+// Dependencies returns reservations of IPs that bridge should have assigned.
 func (b Bridge) Dependencies() (deps []dg.Dependency) {
-	return nil
+	if b.External() {
+		return nil
+	}
+	for _, ip := range b.IPAddresses {
+		deps = append(deps, dg.Dependency{
+			RequiredItem: dg.Reference(genericitems.IPReserve{AddrWithMask: ip}),
+			Description:  "IP address must be reserved for the bridge",
+			MustSatisfy: func(item dg.Item) bool {
+				ipReserve, isIPReserve := item.(genericitems.IPReserve)
+				if !isIPReserve {
+					// Should be unreachable.
+					return false
+				}
+				return ipReserve.NetIf.ItemRef == dg.Reference(b)
+			},
+		})
+	}
+	return deps
+}
+
+// GetAssignedIPs returns IP addresses assigned to the bridge interface.
+// The function is needed for the definition of dependencies for
+// dnsmasq and HTTP server.
+func (b Bridge) GetAssignedIPs() []*net.IPNet {
+	return b.IPAddresses
 }
 
 // BridgeConfigurator implements Configurator interface (libs/reconciler) for Linux bridge.

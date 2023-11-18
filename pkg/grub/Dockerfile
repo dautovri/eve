@@ -16,7 +16,8 @@ ENV BUILD_PKGS automake \
                pkgconf \
                patch \
                gettext-dev \
-               bash
+               bash \
+               gawk
 ENV BUILD_PKGS_arm64 coreutils
 ENV BUILD_PKGS_riscv64 coreutils
 RUN eve-alpine-deploy.sh
@@ -24,7 +25,7 @@ RUN eve-alpine-deploy.sh
 # list of grub modules that are portable between x86_64 and aarch64
 ENV GRUB_MODULES_PORT="part_gpt fat ext2 iso9660 squash4 gzio linux acpi normal cpio crypto disk boot crc64 \
 search_disk_uuid search_part_label search_label xzio xfs video gfxterm serial gptprio chain probe reboot regexp smbios \
-part_msdos cat echo test configfile loopback"
+part_msdos cat echo test configfile loopback true"
 
 FROM grub-build-base AS grub-build-amd64
 ENV GRUB_MODULES="multiboot multiboot2 efi_uga efi_gop linuxefi gpt verify gcry_sha256 measurefs"
@@ -52,7 +53,10 @@ FROM grub-build-${TARGETARCH} AS grub-build
 
 ENV GRUB_REPO=https://git.savannah.gnu.org/cgit/grub.git
 
-COPY / /
+COPY patches /patches
+COPY patches-2.06  /patches-2.06
+COPY patches-aarch64-2.06 /patches-aarch64-2.06
+COPY patches-riscv64-2.06 /patches-riscv64-2.06
 # because python is not available
 RUN ln -s python3 /usr/bin/python && \
     mkdir /grub-lib
@@ -76,11 +80,12 @@ RUN if [ ! -d "grub" ]; then \
         git config --global user.name "Your Name" && \
         git config --global user.email "you@example.com" && \
         git init . && git add . && git commit -m "init" && \
-        git am /apply/patches/* && \
-        (./bootstrap --gnulib-srcdir=/gnulib || ./autogen.sh); \
+        git am /apply/patches/*; \
     fi
 
 WORKDIR /grub
+
+RUN ./bootstrap --gnulib-srcdir=/gnulib || ./autogen.sh
 
 # hadolint ignore=SC2046
 RUN set -e; for p in ${GRUB_PLATFORM}; do \

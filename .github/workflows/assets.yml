@@ -13,16 +13,11 @@
 ---
 name: Assets
 on:  # yamllint disable-line rule:truthy
-  workflow_run:
-    workflows:
-      - Publish
-    types:
-      - completed
-    branches:
-      - "master"
-      - "[0-9]+.[0-9]+"
-      - "[0-9]+.[0-9]+-stable"
-      - "[0-9]+.[0-9]+-lts"
+  workflow_call:
+    inputs:
+      tag_ref:
+        required: true
+        type: string
 
 jobs:
   build:
@@ -32,9 +27,18 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
+      - name: checkout repo
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.tag_ref }}
+          fetch-depth: 0
+      - name: Force fetch annotated tags (workaround)
+        # Workaround for https://github.com/actions/checkout/issues/290
+        run: |
+          git fetch --force --tags
       - name: Determine architecture prefix and ref
         env:
-          REF: ${{ github.event.workflow_run.head_branch }}
+          REF: ${{ inputs.tag_ref }}
         run: |
           # FIXME: I'd rather be a real matrix job with a functional arm64 runner
           # echo "ARCH=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')" >> "$GITHUB_ENV"
@@ -43,19 +47,15 @@ jobs:
           # if the default server is responding -- we can skip apt update
           $APT_INSTALL || { sudo apt update && $APT_INSTALL ; }
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
-          echo "TAG=$(echo "$REF" | sed -e 's#^.*/##' -e 's#master#snapshot#' -e 's#main#snapshot#')" >> "$GITHUB_ENV"
-      - name: checkout repo
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+          echo "TAG=$(git describe --always --tags | grep -E '[0-9]*\.[0-9]*\.[0-9]*' || echo snapshot)" >> "$GITHUB_ENV"
       - name: ensure clean assets dir
-        run : |
+        run: |
           rm -rf assets && mkdir -p assets
       - name: Pull the EVE release from DockerHUB or build it
         run: |
           HV=kvm
           if [ "${{ github.event.repository.full_name }}" = "lf-edge/eve" ]; then
-             EVE=lfedge/eve:${{ env.TAG }}-${HV}-${{ env.ARCH }}
+             EVE=lfedge/eve:${TAG}-${HV}-${{ env.ARCH }}
              docker pull "$EVE"
           else
              make pkgs
@@ -66,25 +66,16 @@ jobs:
           docker run "$EVE" installer_net | tar -C assets -xvf -
       - name: Create direct iPXE config
         run: |
-          URL="${{ github.event.repository.html_url }}/releases/download/${{ env.TAG }}/${{ env.ARCH }}."
+          URL="${{ github.event.repository.html_url }}/releases/download/${TAG}/${{ env.ARCH }}."
           sed -i. -e '/# set url https:/s#^.*$#set url '"$URL"'#' assets/ipxe.efi.cfg
           for comp in initrd rootfs installer; do
               sed -i. -e "s#initrd=${comp}#initrd=${{ env.ARCH }}.${comp}#g" assets/ipxe.efi.cfg
           done
           sed -e 's#{mac:hexhyp}#{ip}#' < assets/ipxe.efi.cfg > assets/ipxe.efi.ip.cfg
-      - name: Unzip kernel on arm64
-        run: |
-          # FIXME: stock iPXE doesn't support compressed kernels on arm64.
-          # EVE's iPXE does, but we still haven't quite figured out the
-          # hand-off part between the two. Therefore for now unpack the kernel.
-          if [ "${{ env.ARCH }}" = arm64 ]; then
-             mv assets/kernel assets/kernel.gz
-             gzip -d assets/kernel.gz
-          fi
       - name: Pull eve-sources and publish collected_sources.tar.gz to assets
         run: |
           HV=kvm
-          EVE_SOURCES=lfedge/eve-sources:${{ env.TAG }}-${HV}-${{ env.ARCH }}
+          EVE_SOURCES=lfedge/eve-sources:${TAG}-${HV}-${{ env.ARCH }}
           docker pull "$EVE_SOURCES"
           docker create --name eve_sources "$EVE_SOURCES" bash
           docker export --output assets/collected_sources.tar.gz eve_sources
@@ -96,7 +87,7 @@ jobs:
           result-encoding: string
           script: |
             console.log(context)
-            tag = '${{ env.TAG }}'
+            const {TAG} = process.env
 
             // first create a release -- it is OK if that fails,
             // since it means the release is already there
@@ -104,8 +95,8 @@ jobs:
               const raw = (await github.repos.createRelease({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                tag_name: tag,
-                name: 'Release ' + tag,
+                tag_name: `${TAG}`,
+                name: `Release ${TAG}`,
                 prerelease: true,
               })).data
               console.log(raw)
@@ -115,7 +106,7 @@ jobs:
             const release = (await github.repos.getReleaseByTag({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag: tag,
+              tag: `${TAG}`,
             })).data
 
             // get assets for that ID

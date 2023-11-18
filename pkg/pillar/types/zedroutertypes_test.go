@@ -12,11 +12,11 @@ import (
 	"time"
 )
 
-var underlayUUID = uuid.UUID{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
+var appNetAdapterUUID = uuid.UUID{0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1,
 	0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8}
 var appNetworkConfig = AppNetworkConfig{
-	UnderlayNetworkList: []UnderlayNetworkConfig{
-		{Network: underlayUUID},
+	AppNetAdapterList: []AppNetAdapterConfig{
+		{Network: appNetAdapterUUID},
 	},
 }
 
@@ -57,20 +57,21 @@ func TestIsIPv6(t *testing.T) {
 		assert.IsType(t, test.expectedValue, isIPv6)
 	}
 }
-func TestGetUnderlayConfig(t *testing.T) {
+func TestGetAppNetAdapterConfig(t *testing.T) {
+	t.Parallel()
 	testMatrix := map[string]struct {
 		network uuid.UUID
 		config  AppNetworkConfig
 	}{
-		"Underlay UUID": {
-			network: underlayUUID,
+		"AppNetAdapter UUID": {
+			network: appNetAdapterUUID,
 			config:  appNetworkConfig,
 		},
 	}
 	for testname, test := range testMatrix {
 		t.Logf("Running test case %s", testname)
-		config := test.config.getUnderlayConfig(test.network)
-		assert.IsType(t, test.config.UnderlayNetworkList[0], *config)
+		config := test.config.getAppNetAdapterConfig(test.network)
+		assert.IsType(t, test.config.AppNetAdapterList[0], *config)
 	}
 }
 func TestIsNetworkUsed(t *testing.T) {
@@ -81,8 +82,8 @@ func TestIsNetworkUsed(t *testing.T) {
 		expectedValue bool
 		config        AppNetworkConfig
 	}{
-		"Underlay UUID": {
-			network:       underlayUUID,
+		"AppNetAdapter UUID": {
+			network:       appNetAdapterUUID,
 			expectedValue: true,
 			config:        appNetworkConfig,
 		},
@@ -105,7 +106,7 @@ var usablePort = NetworkPortConfig{
 	Phylabel:     "eth0",
 	Logicallabel: "eth0",
 	IsMgmt:       true,
-	DhcpConfig:   DhcpConfig{Dhcp: DT_CLIENT},
+	DhcpConfig:   DhcpConfig{Dhcp: DhcpTypeClient},
 }
 var usablePorts = []NetworkPortConfig{usablePort}
 
@@ -114,7 +115,7 @@ var unusablePort1 = NetworkPortConfig{
 	Phylabel:     "eth0",
 	Logicallabel: "eth0",
 	IsMgmt:       false,
-	DhcpConfig:   DhcpConfig{Dhcp: DT_CLIENT},
+	DhcpConfig:   DhcpConfig{Dhcp: DhcpTypeClient},
 }
 var unusablePorts1 = []NetworkPortConfig{unusablePort1}
 
@@ -123,7 +124,7 @@ var unusablePort2 = NetworkPortConfig{
 	Phylabel:     "eth0",
 	Logicallabel: "eth0",
 	IsMgmt:       true,
-	DhcpConfig:   DhcpConfig{Dhcp: DT_NONE},
+	DhcpConfig:   DhcpConfig{Dhcp: DhcpTypeNone},
 }
 var unusablePorts2 = []NetworkPortConfig{unusablePort2}
 var mixedPorts = []NetworkPortConfig{usablePort, unusablePort1, unusablePort2}
@@ -134,7 +135,7 @@ func TestIsDPCUsable(t *testing.T) {
 		devicePortConfig DevicePortConfig
 		expectedValue    bool
 	}{
-		"Management and DT_CLIENT": {
+		"Management and DhcpTypeClient": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
 					LastFailed:    time.Time{},
@@ -154,7 +155,7 @@ func TestIsDPCUsable(t *testing.T) {
 			},
 			expectedValue: true,
 		},
-		"Not management and DT_CLIENT": {
+		"Not management and DhcpTypeClient": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
 					LastFailed:    time.Time{},
@@ -164,7 +165,7 @@ func TestIsDPCUsable(t *testing.T) {
 			},
 			expectedValue: false,
 		},
-		"Management and DT_NONE": {
+		"Management and DhcpTypeNone": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
 					LastFailed:    time.Time{},
@@ -183,56 +184,75 @@ func TestIsDPCUsable(t *testing.T) {
 }
 
 func TestIsDPCTestable(t *testing.T) {
-	n := time.Now()
 	testMatrix := map[string]struct {
 		devicePortConfig DevicePortConfig
 		expectedValue    bool
 	}{
-		"Difference is exactly 60 seconds": {
+		"DPC always failed test and not enough time passed since the last test": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
-					LastFailed:    n.Add(time.Second * 60),
-					LastSucceeded: n,
+					LastFailed:    time.Now().Add(-2 * time.Minute),
+					LastSucceeded: time.Time{},
 				},
 				Ports: usablePorts,
 			},
 			expectedValue: false,
 		},
-		"Difference is 61 seconds": {
+		"DPC succeeded, then failed and not enough time passed since then": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
-					LastFailed:    n.Add(time.Second * 61),
-					LastSucceeded: n,
+					LastFailed:    time.Now().Add(-2 * time.Minute),
+					LastSucceeded: time.Now().Add(-4 * time.Minute),
 				},
 				Ports: usablePorts,
 			},
 			expectedValue: false,
 		},
-		"Difference is 59 seconds": {
+		"DPC always failed test but enough time passed since the last test": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
-					LastFailed:    n.Add(time.Second * 59),
-					LastSucceeded: n,
-				},
-				Ports: usablePorts,
-			},
-			expectedValue: false,
-		},
-		"LastFailed is 0": {
-			devicePortConfig: DevicePortConfig{
-				TestResults: TestResults{
-					LastFailed:    time.Time{},
-					LastSucceeded: n,
+					LastFailed:    time.Now().Add(-6 * time.Minute),
+					LastSucceeded: time.Time{},
 				},
 				Ports: usablePorts,
 			},
 			expectedValue: true,
 		},
-		"Last Succeeded is after Last Failed": {
+		"DPC succeeded, then failed but enough time passed since then": {
 			devicePortConfig: DevicePortConfig{
 				TestResults: TestResults{
-					LastFailed:    n,
-					LastSucceeded: n.Add(time.Second * 61),
+					LastFailed:    time.Now().Add(-6 * time.Minute),
+					LastSucceeded: time.Now().Add(-8 * time.Minute),
+				},
+				Ports: usablePorts,
+			},
+			expectedValue: true,
+		},
+		"DPC always succeeded test": {
+			devicePortConfig: DevicePortConfig{
+				TestResults: TestResults{
+					LastFailed:    time.Time{},
+					LastSucceeded: time.Now().Add(-2 * time.Minute),
+				},
+				Ports: usablePorts,
+			},
+			expectedValue: true,
+		},
+		"DPC failed but later succeeded test": {
+			devicePortConfig: DevicePortConfig{
+				TestResults: TestResults{
+					LastFailed:    time.Now().Add(-4 * time.Minute),
+					LastSucceeded: time.Now().Add(-2 * time.Minute),
+				},
+				Ports: usablePorts,
+			},
+			expectedValue: true,
+		},
+		"Clocks are not synchronized": {
+			devicePortConfig: DevicePortConfig{
+				TestResults: TestResults{
+					LastFailed:    time.Now().Add(time.Hour),
+					LastSucceeded: time.Time{},
 				},
 				Ports: usablePorts,
 			},

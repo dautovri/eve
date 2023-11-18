@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lf-edge/eve/libs/nettrace"
+	"github.com/lf-edge/eve-libs/nettrace"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/hardware"
@@ -151,13 +151,13 @@ func (t *ZedcloudConnectivityTester) getPortsNotReady(
 	if sendErr, isSendErr := verifyErr.(*zedcloud.SendError); isSendErr {
 		portMap := make(map[string]struct{}) // Avoid duplicate entries.
 		for _, attempt := range sendErr.Attempts {
-			var dnsErr *types.DNSNotAvail
+			var dnsErr *types.DNSNotAvailError
 			if errors.As(attempt.Err, &dnsErr) {
 				if port := dns.GetPortByIfName(dnsErr.IfName); port != nil {
 					portMap[port.Logicallabel] = struct{}{}
 				}
 			}
-			var ipErr *types.IPAddrNotAvail
+			var ipErr *types.IPAddrNotAvailError
 			if errors.As(attempt.Err, &ipErr) {
 				if port := dns.GetPortByIfName(ipErr.IfName); port != nil {
 					portMap[port.Logicallabel] = struct{}{}

@@ -15,9 +15,10 @@ import (
 	"net"
 	"sort"
 
-	dg "github.com/lf-edge/eve/libs/depgraph"
+	dg "github.com/lf-edge/eve-libs/depgraph"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/utils"
+	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
+	"github.com/lf-edge/eve/pkg/pillar/utils/netutils"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -111,8 +112,8 @@ type Uplink struct {
 func (u Uplink) Equal(u2 Uplink) bool {
 	return u.LogicalLabel == u2.LogicalLabel &&
 		u.IfName == u2.IfName &&
-		utils.EqualSetsFn(u.DNSServers, u2.DNSServers, utils.EqualIPs) &&
-		utils.EqualSetsFn(u.NTPServers, u2.NTPServers, utils.EqualIPs)
+		generics.EqualSetsFn(u.DNSServers, u2.DNSServers, netutils.EqualIPs) &&
+		generics.EqualSetsFn(u.NTPServers, u2.NTPServers, netutils.EqualIPs)
 }
 
 // AppVIF : describes interface created to connect application with network instance.
@@ -186,8 +187,9 @@ type NIReconcileStatus struct {
 	// BrIfIndex : integer used as a handle for the bridge interface
 	// inside the network stack.
 	BrIfIndex int
-	// AsyncInProgress is true if any async operations are in progress.
-	AsyncInProgress bool
+	// InProgress is true if any config operations are still in progress
+	// (i.e. network instance is not yet fully created).
+	InProgress bool
 	// FailedItems : The set of configuration items currently in a failed state.
 	FailedItems map[dg.ItemRef]error
 }
@@ -204,7 +206,7 @@ func (s NIReconcileStatus) Equal(s2 NIReconcileStatus) bool {
 	}
 	return s.NI == s2.NI && s.Deleted == s2.Deleted &&
 		s.BrIfName == s2.BrIfName &&
-		s.AsyncInProgress == s2.AsyncInProgress
+		s.InProgress == s2.InProgress
 }
 
 // AppConnReconcileStatus : status of the config reconciliation related to application
@@ -221,7 +223,7 @@ type AppConnReconcileStatus struct {
 // Equal compares two instances of AppConnReconcileStatus.
 func (s AppConnReconcileStatus) Equal(s2 AppConnReconcileStatus) bool {
 	return s.App == s2.App && s.Deleted == s2.Deleted &&
-		utils.EqualSetsFn(s.VIFs, s2.VIFs,
+		generics.EqualSetsFn(s.VIFs, s2.VIFs,
 			func(v1, v2 AppVIFReconcileStatus) bool {
 				return v1.Equal(v2)
 			})
@@ -246,14 +248,12 @@ type AppVIFReconcileStatus struct {
 	VIFNum int
 	// HostIfName : name of the interface inside the network stack on the host-side.
 	HostIfName string
-	// Ready is true if the VIF interface is ready for use or if some configuration
-	// operations are still in progress or pending.
-	// VIF is typically created in cooperation with zedmanager + domainmgr, meaning
-	// that NIReconciler may spend some time waiting for an action to be completed
+	// True if any config operations are still in progress
+	// (i.e. VIF is not yet fully created and ready).
+	// Note that VIF is typically created in cooperation with zedmanager + domainmgr,
+	// meaning that NIReconciler may spend some time waiting for an action to be completed
 	// by other microservices.
-	Ready bool
-	// True if any async operations are in progress.
-	AsyncInProgress bool
+	InProgress bool
 	// FailedItems : The set of configuration items currently in a failed state.
 	FailedItems map[dg.ItemRef]error
 }
@@ -269,6 +269,5 @@ func (s AppVIFReconcileStatus) Equal(s2 AppVIFReconcileStatus) bool {
 		}
 	}
 	return s.NetAdapterName == s2.NetAdapterName && s.VIFNum == s2.VIFNum &&
-		s.HostIfName == s2.HostIfName && s.Ready == s2.Ready &&
-		s.AsyncInProgress == s2.AsyncInProgress
+		s.HostIfName == s2.HostIfName && s.InProgress == s2.InProgress
 }

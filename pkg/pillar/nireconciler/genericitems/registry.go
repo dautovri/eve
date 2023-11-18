@@ -4,7 +4,7 @@
 package genericitems
 
 import (
-	"github.com/lf-edge/eve/libs/reconciler"
+	"github.com/lf-edge/eve-libs/reconciler"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/sirupsen/logrus"
 )
@@ -17,6 +17,7 @@ func RegisterItems(log *base.LogObject, logger *logrus.Logger,
 		t string
 	}
 	configurators := []configurator{
+		{c: &IPReserveConfigurator{Log: log}, t: IPReserveTypename},
 		{c: &DnsmasqConfigurator{Log: log, Logger: logger}, t: DnsmasqTypename},
 		{c: &HTTPServerConfigurator{Log: log, Logger: logger}, t: HTTPServerTypename},
 		{c: &RadvdConfigurator{Log: log}, t: RadvdTypename},

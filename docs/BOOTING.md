@@ -131,8 +131,8 @@ in grub.cfg with graphical GRUB menu to get the device to boot again.
     10. `eve_install_skip_persist` - do not install persist partition onto device. May be selected from graphical GRUB menu.
     11. `eve_install_skip_rootfs` - do not install rootfs partition onto device. May be selected from graphical GRUB menu.
     12. `eve_install_skip_zfs_checks` - install zfs by skipping minimum requirement checks.
-    13. `eve_install_zfs_with_raid_level` - Sets raid level for zfs storage. Valid values are none,raid1,raid5,raid6. Default value is none.
-       This option also applied for the first boot of a live image to prepare zfs persist pool instead of ext4.
+    13. `eve_install_zfs_with_raid_level` - Sets raid level for zfs storage. Valid values are none,raid1,raid5,raid6. Default value is none. This option also applied for the first boot of a live image to prepare zfs persist pool instead of ext4.
+    14. `eve_install_kubevirt_reserve_for_eve_sizeGB` - Amount of space in GB to reserve for eve services in kubevirt based images (This is highly experimental and not supported config, also its an optional parameter and defaults to 20GB if not set)
 3. General kernel parameters may be adjusted with `set_global dom0_extra_args "$dom0_extra_args OPTION1=VAL1 OPTION2 "`.
    They will be added to kernel cmdline.
 
@@ -265,6 +265,23 @@ You need to extract needed files with something like `docker run lfedge/eve:late
 You will see a set of files in the current directory to locate into you tftp server to boot Raspberry from it. Also, you should set dhcp-boot option of your
 dhcp server to `ipxe.efi` (actually, it will use configuration from `ipxe.efi.cfg`). Files `kernel`, `initrd.img` and `initrd.bits`
 should be available via HTTP/HTTPs and you need to modify `ipxe.efi.cfg` with location of those files.
+
+## Boot options effect on TPM measurements (PCR-1)
+
+During the boot process, as stated by the TCG specification, BIOS/UEFI should measure the enumerated boot options into the TPM.
+UEFI measures the list of boot options and their configuration data in PCR-1. EVE is using PCR-1 as one of the sealing
+PCRs to protect the vault key from unauthorized access (check [Encrypted Data Store](./SECURITY.md#encrypted-data-store) for more details),
+so it is important for the edge node to have a fixed and consistent list of boot options after onboarding. Attaching any
+bootable device, most notably USB devices, will result in a different set of boot options and subsequently change of
+the PCR-1 value. If a USB disk is used as an extra storage, **it is important to make sure the attached USB device has no bootable partition present**.
+
+### Check USB is bootable or not
+
+You can check it by examining the `Flags` output of a tool like `parted`, for example executing the following command should result in no output (make sure to replace `/dev/sda` with your own USB device, you can list all using `parted -l`):
+
+```bash
+parted /dev/sda print | grep boot
+```
 
 ## Console access
 

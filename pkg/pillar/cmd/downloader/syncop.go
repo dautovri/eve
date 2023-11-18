@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	zconfig "github.com/lf-edge/eve/api/go/config"
-	"github.com/lf-edge/eve/libs/nettrace"
-	"github.com/lf-edge/eve/libs/zedUpload"
+	zconfig "github.com/lf-edge/eve-api/go/config"
+	"github.com/lf-edge/eve-libs/nettrace"
+	"github.com/lf-edge/eve-libs/zedUpload"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/netdump"
@@ -201,6 +201,13 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	withNetTracing := ctx.netDumper != nil && !dsLocal && trType != zedUpload.SyncSftpTr
 	var traceOpts []nettrace.TraceOpt
 	if withNetTracing {
+		// Include HTTP header field values only if explicitly enabled.
+		// By default, we record only the length of values.
+		// May contain secrets (e.g. datastore credentials).
+		headerFieldsOpt := nettrace.HdrFieldsOptValueLenOnly
+		if ctx.netdumpWithHdrFieldVal {
+			headerFieldsOpt = nettrace.HdrFieldsOptWithValues
+		}
 		// Avoid socket trace for download. Otherwise, it would increase
 		// the size of the resulting netdump considerably.
 		traceOpts = []nettrace.TraceOpt{
@@ -210,9 +217,7 @@ func handleSyncOp(ctx *downloaderContext, key string,
 			&nettrace.WithConntrack{},
 			&nettrace.WithDNSQueryTrace{},
 			&nettrace.WithHTTPReqTrace{
-				// Do not disclose sensitive data stored inside headers,
-				// record only their length.
-				HeaderFields: nettrace.HdrFieldsOptValueLenOnly,
+				HeaderFields: headerFieldsOpt,
 			},
 		}
 		if ctx.netdumpWithPCAP {
