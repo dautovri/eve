@@ -125,6 +125,13 @@ func (m *DpcManager) updateDNS() {
 			ipAddrs = nil
 		}
 		m.deviceNetStatus.Ports[ix].MacAddr = macAddr
+
+		// Below this point we collect L3-specific info for the port.
+		if !port.IsL3Port {
+			m.deviceNetStatus.Ports[ix].AddrInfoList = nil
+			continue
+		}
+
 		m.deviceNetStatus.Ports[ix].AddrInfoList = make([]types.AddrInfo, len(ipAddrs))
 		if len(ipAddrs) == 0 {
 			m.Log.Functionf("updateDNS: interface %s has NO IP addresses", port.IfName)
@@ -132,6 +139,7 @@ func (m *DpcManager) updateDNS() {
 		for i, addr := range ipAddrs {
 			m.deviceNetStatus.Ports[ix].AddrInfoList[i].Addr = addr.IP
 		}
+
 		// Get DNS etc info from dhcpcd. Updates DomainName and DNSServers.
 		err = m.getDHCPInfo(&m.deviceNetStatus.Ports[ix])
 		if err != nil && dpc.State != types.DPCStateAsyncWait {

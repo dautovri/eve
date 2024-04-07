@@ -26,6 +26,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
+	"github.com/lf-edge/eve/pkg/pillar/utils/netutils"
 	"github.com/vishvananda/netlink"
 )
 
@@ -186,7 +187,7 @@ type LinuxDpcReconciler struct {
 	resumeReconcile  chan struct{}
 	resumeAsync      <-chan string // nil if no async ops
 
-	prevArgs     Args
+	lastArgs     Args
 	prevStatus   ReconcileStatus
 	radioSilence types.RadioSilence
 	HVTypeKube   bool
@@ -215,14 +216,16 @@ const (
 
 // GetCurrentState : get the current state (read-only).
 // Exported only for unit-testing purposes.
-func (r *LinuxDpcReconciler) GetCurrentState() dg.GraphR {
-	return r.currentState
+func (r *LinuxDpcReconciler) GetCurrentState() (graph dg.GraphR, release func()) {
+	release = r.pauseWatcher()
+	return r.currentState, release
 }
 
 // GetIntendedState : get the intended state (read-only).
 // Exported only for unit-testing purposes.
-func (r *LinuxDpcReconciler) GetIntendedState() dg.GraphR {
-	return r.intendedState
+func (r *LinuxDpcReconciler) GetIntendedState() (graph dg.GraphR, release func()) {
+	release = r.pauseWatcher()
+	return r.intendedState, release
 }
 
 func (r *LinuxDpcReconciler) init() (startWatcher func()) {
@@ -283,31 +286,31 @@ func (r *LinuxDpcReconciler) watcher(netEvents <-chan netmonitor.Event) {
 				}
 			case netmonitor.IfChange:
 				if ev.Added || ev.Deleted {
-					changed := r.updateCurrentPhysicalIO(r.prevArgs.DPC, r.prevArgs.AA)
+					changed := r.updateCurrentPhysicalIO(r.lastArgs.DPC, r.lastArgs.AA)
 					if changed {
 						r.addPendingReconcile(
 							PhysicalIoSG, "interface added/deleted", true)
 					}
 				}
 				if ev.Deleted {
-					changed := r.updateCurrentRoutes(r.prevArgs.DPC)
+					changed := r.updateCurrentRoutes(r.lastArgs.DPC)
 					if changed {
 						r.addPendingReconcile(
 							L3SG, "interface delete triggered route change", true)
 					}
 				}
 			case netmonitor.AddrChange:
-				changed := r.updateCurrentAdapterAddrs(r.prevArgs.DPC)
+				changed := r.updateCurrentAdapterAddrs(r.lastArgs.DPC)
 				if changed {
 					r.addPendingReconcile(L3SG, "address change", true)
 				}
-				changed = r.updateCurrentRoutes(r.prevArgs.DPC)
+				changed = r.updateCurrentRoutes(r.lastArgs.DPC)
 				if changed {
 					r.addPendingReconcile(L3SG, "address change triggered route change", true)
 				}
 
 			case netmonitor.DNSInfoChange:
-				newGlobalCfg := r.getIntendedGlobalCfg(r.prevArgs.DPC)
+				newGlobalCfg := r.getIntendedGlobalCfg(r.lastArgs.DPC)
 				prevGlobalCfg := r.intendedState.SubGraph(GlobalSG)
 				if len(prevGlobalCfg.DiffItems(newGlobalCfg)) > 0 {
 					r.addPendingReconcile(GlobalSG, "DNS info change", true)
@@ -317,8 +320,15 @@ func (r *LinuxDpcReconciler) watcher(netEvents <-chan netmonitor.Event) {
 		case ctrl = <-r.watcherControl:
 			if ctrl == watcherCtrlPause {
 				r.Unlock()
-				for ctrl != watcherCtrlCont {
+				pauseCnt := 1
+				for pauseCnt != 0 {
 					ctrl = <-r.watcherControl
+					switch ctrl {
+					case watcherCtrlPause:
+						pauseCnt++
+					case watcherCtrlCont:
+						pauseCnt--
+					}
 				}
 				r.Lock()
 			}
@@ -543,7 +553,7 @@ func (r *LinuxDpcReconciler) Reconcile(ctx context.Context, args Args) Reconcile
 	}
 
 	// Update the internal state.
-	r.prevArgs = args
+	r.saveArgs(args)
 	r.prevStatus = newStatus
 	r.resumeAsync = rs.ReadyToResume
 	r.pendingReconcile.isPending = false
@@ -582,21 +592,36 @@ func (r *LinuxDpcReconciler) Reconcile(ctx context.Context, args Args) Reconcile
 	return newStatus
 }
 
+func (r *LinuxDpcReconciler) saveArgs(args Args) {
+	r.lastArgs = args
+	// Make sure the arguments are copied so that we avoid race conditions
+	// between DpcReconciler and DPCManager.
+	r.lastArgs.DPC.Ports = make([]types.NetworkPortConfig, len(args.DPC.Ports))
+	for i := range args.DPC.Ports {
+		r.lastArgs.DPC.Ports[i] = args.DPC.Ports[i]
+	}
+	r.lastArgs.AA.IoBundleList = make([]types.IoBundle, len(args.AA.IoBundleList))
+	for i := range args.AA.IoBundleList {
+		r.lastArgs.AA.IoBundleList[i] = args.AA.IoBundleList[i]
+	}
+}
+
 func (r *LinuxDpcReconciler) dpcChanged(newDPC types.DevicePortConfig) bool {
-	return !r.prevArgs.DPC.MostlyEqual(&newDPC)
+	return !r.lastArgs.DPC.MostlyEqual(&newDPC)
 }
 
 func (r *LinuxDpcReconciler) aaChanged(newAA types.AssignableAdapters) bool {
-	if len(newAA.IoBundleList) != len(r.prevArgs.AA.IoBundleList) {
+	if len(newAA.IoBundleList) != len(r.lastArgs.AA.IoBundleList) {
 		return true
 	}
 	for i := range newAA.IoBundleList {
 		newIo := newAA.IoBundleList[i]
-		prevIo := r.prevArgs.AA.IoBundleList[i]
+		prevIo := r.lastArgs.AA.IoBundleList[i]
 		// Compare only attributes used by DpcReconciler.
 		if prevIo.Logicallabel != newIo.Logicallabel ||
 			prevIo.Ifname != newIo.Ifname ||
 			prevIo.UsbAddr != newIo.UsbAddr ||
+			prevIo.UsbProduct != newIo.UsbProduct ||
 			prevIo.PciLong != newIo.PciLong ||
 			prevIo.IsPCIBack != newIo.IsPCIBack {
 			return true
@@ -606,16 +631,16 @@ func (r *LinuxDpcReconciler) aaChanged(newAA types.AssignableAdapters) bool {
 }
 
 func (r *LinuxDpcReconciler) rsChanged(newRS types.RadioSilence) bool {
-	return r.prevArgs.RS.Imposed != newRS.Imposed
+	return r.lastArgs.RS.Imposed != newRS.Imposed
 }
 
 func (r *LinuxDpcReconciler) gcpChanged(newGCP types.ConfigItemValueMap) bool {
-	prevAuthKeys := r.prevArgs.GCP.GlobalValueString(types.SSHAuthorizedKeys)
+	prevAuthKeys := r.lastArgs.GCP.GlobalValueString(types.SSHAuthorizedKeys)
 	newAuthKeys := newGCP.GlobalValueString(types.SSHAuthorizedKeys)
 	if prevAuthKeys != newAuthKeys {
 		return true
 	}
-	prevAllowVNC := r.prevArgs.GCP.GlobalValueBool(types.AllowAppVnc)
+	prevAllowVNC := r.lastArgs.GCP.GlobalValueBool(types.AllowAppVnc)
 	newAllowVNC := newGCP.GlobalValueBool(types.AllowAppVnc)
 	if prevAllowVNC != newAllowVNC {
 		return true
@@ -1175,7 +1200,7 @@ func (r *LinuxDpcReconciler) groupPortAddrs(dpc types.DevicePortConfig) map[stri
 			continue
 		}
 		for _, ipAddr := range ipAddrs {
-			if devicenetwork.HostFamily(ipAddr.IP) != syscall.AF_INET {
+			if netutils.HostFamily(ipAddr.IP) != syscall.AF_INET {
 				continue
 			}
 			subnet := &net.IPNet{Mask: ipAddr.Mask, IP: ipAddr.IP.Mask(ipAddr.Mask)}
@@ -1449,6 +1474,7 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		{Table: "filter", ChainName: "INPUT"}:       {devACLs: true, appACLs: true},
 		{Table: "filter", ChainName: "FORWARD"}:     {devACLs: false, appACLs: true},
 		{Table: "mangle", ChainName: "PREROUTING"}:  {devACLs: true, appACLs: true},
+		{Table: "mangle", ChainName: "FORWARD"}:     {devACLs: true, appACLs: false},
 		{Table: "mangle", ChainName: "POSTROUTING"}: {devACLs: false, appACLs: true},
 		{Table: "mangle", ChainName: "OUTPUT"}:      {devACLs: true, appACLs: false},
 		{Table: "nat", ChainName: "PREROUTING"}:     {devACLs: false, appACLs: true},
@@ -1622,35 +1648,35 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		RuleLabel:   "SSH and Guacamole mark",
 		MatchOpts:   []string{"-p", "tcp", "--match", "multiport", "--dports", "22,4822"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_http_ssh_guacamole"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_http_ssh_guacamole")},
 		Description: "Mark ingress SSH and Guacamole traffic",
 	}
 	markVnc := iptables.Rule{
 		RuleLabel:   "VNC mark",
 		MatchOpts:   []string{"-p", "tcp", "--match", "multiport", "--dports", "5900:5999"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_vnc"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_vnc")},
 		Description: "Mark ingress VNC traffic",
 	}
 	markIcmpV4 := iptables.Rule{
 		RuleLabel:   "ICMP mark",
 		MatchOpts:   []string{"-p", "icmp"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_icmp"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_icmp")},
 		Description: "Mark ingress ICMP traffic",
 	}
 	markIcmpV6 := iptables.Rule{
 		RuleLabel:   "ICMPv6 traffic",
 		MatchOpts:   []string{"-p", "icmpv6"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_icmp"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_icmp")},
 		Description: "Mark ingress ICMPv6 traffic",
 	}
 	markDhcp := iptables.Rule{
 		RuleLabel:   "DHCP mark",
 		MatchOpts:   []string{"-p", "udp", "--dport", "bootps:bootpc"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_dhcp"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_dhcp")},
 		Description: "Mark ingress DHCP traffic",
 	}
 	// Allow kubernetes DNS replies from an external server.
@@ -1660,7 +1686,7 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		RuleLabel:   "Incoming DNS replies",
 		MatchOpts:   []string{"-p", "udp", "--sport", "domain"},
 		Target:      "CONNMARK",
-		TargetOpts:  []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["in_dns"]},
+		TargetOpts:  []string{"--set-mark", controlProtoMark("in_dns")},
 		Description: "Incoming DNS replies (used to allow kubernetes DNS replies from external server)",
 	}
 
@@ -1673,6 +1699,40 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 	protoMarkV6Rules := []iptables.Rule{
 		markSSHAndGuacamole, markVnc, markIcmpV6,
 	}
+
+	// Do not overwrite mark that was already added be rules from zedrouter
+	// for application traffic.
+	skipMarkedFlowRule := iptables.Rule{
+		RuleLabel: "Skip marked ingress",
+		ChainName: "PREROUTING" + iptables.DeviceChainSuffix,
+		Table:     "mangle",
+		MatchOpts: []string{"-m", "mark", "!", "--mark", "0"},
+		Target:    "RETURN",
+	}
+	for _, markV4Rule := range protoMarkV4Rules {
+		skipMarkedFlowRule.AppliedBefore = append(skipMarkedFlowRule.AppliedBefore,
+			markV4Rule.RuleLabel)
+	}
+	intendedIPv4ACLs.PutItem(skipMarkedFlowRule, nil)
+	restoreConnmarkRule := iptables.Rule{
+		RuleLabel:     "Restore ingress mark",
+		ChainName:     "PREROUTING" + iptables.DeviceChainSuffix,
+		Table:         "mangle",
+		Target:        "CONNMARK",
+		TargetOpts:    []string{"--restore-mark"},
+		AppliedBefore: []string{skipMarkedFlowRule.RuleLabel},
+	}
+	intendedIPv4ACLs.PutItem(restoreConnmarkRule, nil)
+	// The same for IPv6:
+	skipMarkedFlowRule.ForIPv6 = true
+	skipMarkedFlowRule.AppliedBefore = nil
+	for _, markV6Rule := range protoMarkV6Rules {
+		skipMarkedFlowRule.AppliedBefore = append(skipMarkedFlowRule.AppliedBefore,
+			markV6Rule.RuleLabel)
+	}
+	intendedIPv6ACLs.PutItem(skipMarkedFlowRule, nil)
+	restoreConnmarkRule.ForIPv6 = true
+	intendedIPv6ACLs.PutItem(restoreConnmarkRule, nil)
 
 	// Mark ingress traffic not matched by the rules above with the DROP action.
 	// Create a separate chain for marking.
@@ -1687,7 +1747,7 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		Table:     "mangle",
 		ForIPv6:   true,
 	}, nil)
-	ingressDefDrop := iptables.GetConnmark(0, iptables.DefaultDropAceID, true)
+	ingressDefDrop := iptables.GetConnmark(0, iptables.DefaultDropAceID, false, true)
 	ingressDefDropStr := strconv.FormatUint(uint64(ingressDefDrop), 10)
 	ingressDefDropRules := []iptables.Rule{
 		{
@@ -1766,6 +1826,24 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		intendedIPv6ACLs.PutItem(markRule, nil)
 	}
 
+	// Deny traffic forwarding between device ports (e.g. from eth0 to eth1).
+	// Simply drop all non-application forwarded traffic.
+	// Zero application mark means that the matched flow is not from/to application.
+	nonAppMark := fmt.Sprintf("0/%d", iptables.AppIDMask)
+	denyNonAppForwarding := iptables.Rule{
+		RuleLabel: "Drop traffic forwarded between ports",
+		Table:     "mangle",
+		ChainName: "FORWARD" + iptables.DeviceChainSuffix,
+		MatchOpts: []string{"--match", "connmark", "--mark", nonAppMark},
+		Target:    "DROP",
+		Description: "Rule to ensure that forwarding between device ports is not allowed " +
+			"(device cannot be used as a router to hop from one network to another)",
+	}
+	denyNonAppForwarding.ForIPv6 = false
+	intendedIPv4ACLs.PutItem(denyNonAppForwarding, nil)
+	denyNonAppForwarding.ForIPv6 = true
+	intendedIPv6ACLs.PutItem(denyNonAppForwarding, nil)
+
 	// Mark all un-marked local traffic generated by local services.
 	outputRules := []iptables.Rule{
 		{
@@ -1781,7 +1859,7 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		{
 			RuleLabel:  "Default egress mark",
 			Target:     "MARK",
-			TargetOpts: []string{"--set-mark", iptables.ControlProtocolMarkingIDMap["out_all"]},
+			TargetOpts: []string{"--set-mark", controlProtoMark("out_all")},
 		},
 		{
 			RuleLabel:  "Save egress mark",
@@ -1802,4 +1880,9 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 		intendedIPv6ACLs.PutItem(outputRule, nil)
 	}
 	return intendedACLs
+}
+
+func controlProtoMark(protoName string) string {
+	mark := iptables.ControlProtocolMarkingIDMap[protoName]
+	return strconv.FormatUint(uint64(mark), 10)
 }

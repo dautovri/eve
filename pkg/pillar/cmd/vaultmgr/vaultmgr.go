@@ -188,7 +188,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	// if any args defined, will run command inline and return
 	if len(ctx.args) > 0 {
-		return runInline(ctx.args[0], ctx.args[1:])
+		return runInline(ps, ctx.args[0], ctx.args[1:])
 	}
 
 	log.Functionf("Starting %s\n", agentName)
@@ -309,11 +309,16 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 }
 
-func runInline(command string, _ []string) int {
+func runInline(ps *pubsub.PubSub, command string, _ []string) int {
 	switch command {
 	case "setupDeprecatedVaults":
 		if err := handler.SetupDeprecatedVaults(); err != nil {
 			log.Error(err)
+			return 1
+		}
+	case "waitUnsealed":
+		if err := utils.WaitForVault(ps, log, agentName, warningTime, errorTime); err != nil {
+			log.Fatal(err)
 			return 1
 		}
 	default:
@@ -487,7 +492,8 @@ func publishVaultKey(ctx *vaultMgrContext, vaultName string) error {
 	var encryptedVaultKey []byte
 	//we try to fill EncryptedVaultKey only in case of tpm enabled
 	//otherwise we leave it empty
-	if etpm.IsTpmEnabled() {
+	isTpmEnabled := etpm.IsTpmEnabled()
+	if isTpmEnabled {
 		if !ctx.defaultVaultUnlocked {
 			log.Errorf("Vault is not yet unlocked, waiting for Controller key")
 			return nil
@@ -499,6 +505,7 @@ func publishVaultKey(ctx *vaultMgrContext, vaultName string) error {
 
 		encryptedKey, err := etpm.EncryptDecryptUsingTpm(keyBytes, true)
 		if err != nil {
+			// XXX should we still send with no key?
 			return fmt.Errorf("Failed to encrypt vault key %w", err)
 		}
 
@@ -519,6 +526,7 @@ func publishVaultKey(ctx *vaultMgrContext, vaultName string) error {
 	keyFromDevice := types.EncryptedVaultKeyFromDevice{}
 	keyFromDevice.Name = vaultName
 	keyFromDevice.EncryptedVaultKey = encryptedVaultKey
+	keyFromDevice.IsTpmEnabled = isTpmEnabled
 	key := keyFromDevice.Key()
 	log.Tracef("Publishing EncryptedVaultKeyFromDevice %s\n", key)
 	pub := ctx.pubVaultKeyFromDevice

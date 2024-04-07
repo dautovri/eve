@@ -1,21 +1,20 @@
 #!/bin/bash
 
 img="$1"
-ip="$2"
+url="$2"
 
-if [ "$img" == "" ] || [ "$ip" == "" ]; then
-  echo "Usage ./publish_verification_info.sh <USB_device_name|verification_img> <server_ip>"
-  echo "E.g., ./publish_verification_info.sh /dev/disk4 147.52.71.221"
-  echo "Or, ./publish_verification_info.sh dist/amd64/current/verification.img 147.52.71.221"
+if [ "$img" == "" ] || [ "$url" == "" ] || [ "$EUID" -ne 0 ]; then
+  echo "Usage sudo ./publish-verification-info.sh <USB_device_name|verification_img> <server_url>"
+  echo "E.g., sudo ./publish-verification-info.sh /dev/disk4 https://somewhere.example.com:8999"
+  echo "Or, sudo ./publish-verification-info.sh dist/amd64/current/verification.raw https://somewhere.example.com:8999"
   exit
 fi
 
-checkOScmd="echo ${OSTYPE} | grep -q darwin" # Running on MacOS
-checkVerificationImg="eval file ${img} | grep -q DOS/MBR" # this is a file not a block device
+checkOScmd=$(echo "${OSTYPE}" | grep darwin) # Running on MacOS
 mountDir="/tmp/verification_mnt"
-if eval "${checkOScmd}"; then # MacOS
+if [ -n "${checkOScmd}" ];  then # MacOS
   devicename="${img}"
-  if eval "${checkVerificationImg}"; then # file
+  if [ -f "${img}" ]; then # file
     tmp=$(/usr/bin/hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount "${img}")
     devicename=$(echo "${tmp}" | grep "GUID_partition_scheme" | awk '{print $1}')
   fi
@@ -23,11 +22,11 @@ if eval "${checkOScmd}"; then # MacOS
   mountDir="/Volumes/INVENTORY/"
 else # Linux
   mkdir "${mountDir}"
-  if eval "${checkVerificationImg}"; then # file
+  if [ -f "${img}" ]; then # file
     size=$(fdisk -l "$img" | grep raw5 | awk '{print $2}')
-    sudo mount -o offset=$((size*512)) "$img" "${mountDir}"
+    mount -o offset=$((size*512)) "$img" "${mountDir}"
   else # block device
-    sudo mount "${img}"5 "${mountDir}"
+    mount "${img}"5 "${mountDir}"
   fi
 fi
 
@@ -46,16 +45,16 @@ fname="${dirname}.tar.gz"
 tar zcvf "${fname}" "${dirname}"
 rm -rf "${dirname}"
 
-CSRF_TOKEN=$(curl -s -c cookies.txt "http://$ip:8999/upload" | xmllint --html --xpath 'string(//input[@name="csrfmiddlewaretoken"]/@value)' - 2>/dev/null)
-curl -X POST -b cookies.txt -F "csrfmiddlewaretoken=$CSRF_TOKEN" -F  "file=@${fname}" "http://$ip:8999/upload"
+CSRF_TOKEN=$(curl -s -c cookies.txt "$url/upload" | xmllint --html --xpath 'string(//input[@name="csrfmiddlewaretoken"]/@value)' - 2>/dev/null)
+curl -e "$url" -X POST -b cookies.txt -F "csrfmiddlewaretoken=$CSRF_TOKEN" -F  "file=@${fname}" "$url/upload"
 
 rm cookies.txt "${fname}"
-if eval "${checkOScmd}"; then # MacOS
+if [ -n "${checkOScmd}" ]; then # MacOS
   /usr/sbin/diskutil umount "${devicename}"s5
-  if eval "${checkVerificationImg}"; then # file
+  if [ -f "${img}" ]; then # file
     /usr/bin/hdiutil detach "${devicename}"
   fi
 else # Linux
-  sudo umount "${mountDir}"
+  umount "${mountDir}"
   rmdir "${mountDir}"
 fi

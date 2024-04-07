@@ -203,7 +203,7 @@ pe\":\"a\",\"major\":0,\"minor\":0}],\"net\":\"host\",\"pid\":\"host\",\"rootfsP
 The git commit for the above source is given in the label `"org.opencontainers.image.revision": "12a6fb8d29a6b47f998cd077dfb92213f0e6a55f"`, i.e.
 you can get the same commit via `git checkout 12a6fb8d29a6b47f998cd077dfb92213f0e6a55f`.
 
-The above _should_ be the same as the git commit you checked out in the stage [Binary to source commit][Binary to source commit].
+The above _should_ be the same as the git commit you checked out in the stage [Binary to source commit](#binary-to-source-commit).
 Nonetheless, even if it is not, the git commit given by the label is the git commit that was used to build
 this particular container image.
 
@@ -650,7 +650,7 @@ license="GPL-2.0-or-later"
 depends_dev="linux-headers"
 makedepends="$depends_dev libnftnl-dev bison flex autoconf automake"
 subpackages="ip6tables $pkgname-doc $pkgname-dev $pkgname-openrc ip6tables-openrc:ip6tables_openrc"
-provides="ebtables" # for backards compat
+provides="ebtables" # for backwards compat
 replaces="ebtables"
 source="https://www.netfilter.org/projects/iptables/files/iptables-$pkgver.tar.bz2
     use-sh-iptables-apply.patch

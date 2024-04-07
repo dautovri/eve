@@ -28,6 +28,7 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/typeurl"
 	"github.com/lf-edge/edge-containers/pkg/resolver"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/vault"
 	"github.com/opencontainers/go-digest"
@@ -49,6 +50,8 @@ const (
 	ctrdSystemServicesNamespace = "services.linuxkit"
 	// ctrdServicesNamespace containerd namespace for running user containers
 	ctrdServicesNamespace = "eve-user-apps"
+	// ctrdKubeServicesNamespace containerd namespace for running user containers in kube-containerd
+	ctrdKubeServicesNamespace = "k8s.io"
 	//containerdRunTime - default runtime of containerd
 	containerdRunTime = "io.containerd.runc.v2"
 	// container config file name
@@ -73,6 +76,10 @@ const (
 var (
 	// default snapshotter used by containerd
 	defaultSnapshotter = "overlayfs"
+	// default services namespace
+	servicesNamespace = ctrdServicesNamespace
+	// shouldStartUserContainerd tracks if we are starting user-app containerd
+	shouldStartUserContainerd = true
 )
 
 // Client is the handle we return to the caller
@@ -81,10 +88,10 @@ type Client struct {
 	contentStore content.Store
 }
 
-// GetServicesNamespace returns ctrdServicesNamespace
+// GetServicesNamespace returns defaultServicesNamespace
 // The value is used to define the cgroups path of the EVE services
 func GetServicesNamespace() string {
-	return ctrdServicesNamespace
+	return servicesNamespace
 }
 
 func init() {
@@ -92,6 +99,13 @@ func init() {
 	// see if we need to use zfs snapshotter based on what flavor of storage persist partition is
 	if vault.ReadPersistType() == types.PersistZFS {
 		defaultSnapshotter = types.ZFSSnapshotter
+	}
+
+	if base.IsHVTypeKube() {
+		defaultSnapshotter = "overlayfs"
+		servicesNamespace = ctrdKubeServicesNamespace
+		// kubevirt image starts its own containerd in the kube container
+		shouldStartUserContainerd = false
 	}
 }
 
@@ -254,6 +268,7 @@ func (client *Client) CtrLoadImage(ctx context.Context, reader *os.File) ([]imag
 // CtrGetImage returns image object for the reference. Returns error if no image is found for the reference.
 func (client *Client) CtrGetImage(ctx context.Context, reference string) (containerd.Image, error) {
 	if err := client.verifyCtr(ctx, true); err != nil {
+		logrus.Errorf("CtrGetImage: exception while verifying ctrd client: %s", err.Error())
 		return nil, fmt.Errorf("CtrGetImage: exception while verifying ctrd client: %s", err.Error())
 	}
 	image, err := client.ctrdClient.GetImage(ctx, reference)
@@ -391,7 +406,7 @@ func (client *Client) CtrListContainerIds(ctx context.Context) ([]string, error)
 	return res, nil
 }
 
-// CtrListContainer returns a list of containerd.Container ibjects
+// CtrListContainer returns a list of containerd.Container objects
 func (client *Client) CtrListContainer(ctx context.Context) ([]containerd.Container, error) {
 	if err := client.verifyCtr(ctx, true); err != nil {
 		return nil, fmt.Errorf("CtrListContainer: exception while verifying ctrd client: %s", err.Error())
@@ -419,7 +434,7 @@ func (client *Client) CtrGetContainerMetrics(ctx context.Context, containerID st
 		return nil, err
 	}
 
-	data, err := typeurl.UnmarshalAny(m.Data)
+	data, err := typeurl.UnmarshalByTypeURL(m.Data.GetTypeUrl(), m.Data.GetValue())
 	if err != nil {
 		return nil, err
 	}
@@ -635,7 +650,7 @@ func (client *Client) Resolver(ctx context.Context) (resolver.ResolverCloser, er
 // CtrNewUserServicesCtx returns a new user service containerd context
 // and a done func to cancel the context after use.
 func (client *Client) CtrNewUserServicesCtx() (context.Context, context.CancelFunc) {
-	return newServiceCtx(ctrdServicesNamespace)
+	return newServiceCtx(servicesNamespace)
 }
 
 // CtrNewSystemServicesCtx returns a new system service containerd context
@@ -647,7 +662,7 @@ func (client *Client) CtrNewSystemServicesCtx() (context.Context, context.Cancel
 // CtrNewUserServicesCtxWithLease returns a new user service containerd context with a 24 hrs lease
 // and a done func to delete the lease and cancel the context after use.
 func (client *Client) CtrNewUserServicesCtxWithLease() (context.Context, context.CancelFunc, error) {
-	return newServiceCtxWithLease(client.ctrdClient, ctrdServicesNamespace)
+	return newServiceCtxWithLease(client.ctrdClient, servicesNamespace)
 }
 
 // CtrNewSystemServicesCtxWithLease returns a new system service containerd context with a 24 hrs lease
@@ -799,6 +814,11 @@ func (client *Client) verifyCtr(ctx context.Context, verifyCtx bool) error {
 		if ctx.Err() == context.Canceled {
 			return fmt.Errorf("verifyCtr: Containerd context is calcelled")
 		}
+
+		if ctx.Err() != nil {
+			logrus.Warnf("verifyCtr: Containerd context is in error state: %s", ctx.Err().Error())
+			return fmt.Errorf("verifyCtr: Containerd context is closed")
+		}
 	}
 	return nil
 }
@@ -885,6 +905,9 @@ func (client *Client) UnpackClientImage(clientImage containerd.Image) error {
 
 // StartUserContainerdInstance execute user containerd instance in goroutine
 func StartUserContainerdInstance() error {
+	if !shouldStartUserContainerd {
+		return nil
+	}
 	name := "/usr/bin/containerd"
 	args := []string{"--config", "/etc/containerd/user.toml"}
 	cmd := exec.Command(name, args...)

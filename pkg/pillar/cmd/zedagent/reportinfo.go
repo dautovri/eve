@@ -630,6 +630,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 	ReportDeviceInfo.RebootInprogress = ctx.rebootCmd || ctx.deviceReboot
 
 	ReportDeviceInfo.Capabilities = getCapabilities(ctx)
+	ReportDeviceInfo.OptionalCapabilities = getOptionalCapabilities(ctx)
 
 	devState := getDeviceState(ctx)
 	if ctx.devState != devState {
@@ -642,7 +643,7 @@ func PublishDeviceInfoToZedCloud(ctx *zedagentContext, dest destinationBitset) {
 	// We report the snapshot capability despite the fact that we support snapshots only
 	// for file-based volumes. If a controller tries to make a snapshot of ZFS-based volume
 	// device returns a runtime error.
-	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_VOLUME_SNAPSHOTS
+	ReportDeviceInfo.ApiCapability = info.APICapability_API_CAPABILITY_NETWORK_INSTANCE_ROUTING
 
 	// Report if there is a local override of profile
 	if ctx.getconfigCtx.sideController.currentProfile !=
@@ -1259,6 +1260,12 @@ func getCapabilities(ctx *zedagentContext) *info.Capabilities {
 	return &info.Capabilities{
 		HWAssistedVirtualization: capabilities.HWAssistedVirtualization,
 		IOVirtualization:         capabilities.IOVirtualization,
+	}
+}
+
+func getOptionalCapabilities(ctx *zedagentContext) *info.OptionalCapabilities {
+	return &info.OptionalCapabilities{
+		HvTypeKubevirt: ctx.hvTypeKube,
 	}
 }
 

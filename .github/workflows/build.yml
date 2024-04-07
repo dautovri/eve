@@ -20,9 +20,9 @@ jobs:
         include:
           - os: buildjet-4vcpu-ubuntu-2204-arm
             arch: arm64
-          - os: ubuntu-20.04
+          - os: buildjet-4vcpu-ubuntu-2004
             arch: amd64
-          - os: ubuntu-20.04
+          - os: buildjet-4vcpu-ubuntu-2004
             arch: riscv64
     steps:
       - name: Starting Report
@@ -38,7 +38,7 @@ jobs:
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
           rm -fr ~/.linuxkit
           docker system prune --all --force --volumes
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: ensure zstd for cache  # this should be removed once the arm64 VM includes zstd
@@ -71,7 +71,7 @@ jobs:
 
   eve:
     needs: packages  # all packages for all platforms must be built first
-    runs-on: ubuntu-20.04
+    runs-on: buildjet-4vcpu-ubuntu-2004
     strategy:
       fail-fast: false
       matrix:
@@ -81,9 +81,15 @@ jobs:
           - arch: riscv64
             hv: mini
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # the next three steps - cache_for_docker, load images, and cache_for_packages -
+      # having nothing to do with the content of the final eve image. Instead, it is because we are running
+      # on amd64, and we need some of the tools in order to compose the final eve image for the target arch.
+      # These tools are in pkg/, and therefore are part of packages, and we need them in docker.
+      # Rather than build them again, we just restore the cache for our runner architecture,
+      # load them into docker, and then clear the cache so we can load the cache for the target arch.
       - name: update linuxkit cache for runner arch so we can get desired images
         id: cache_for_docker
         uses: actions/cache/restore@v3
@@ -98,6 +104,7 @@ jobs:
         if: ${{ matrix.arch != 'amd64' }}  # because our runner arch is amd64; if that changes, this will have to change
         run: |
           rm -rf ~/.linuxkit
+      # With the "load into docker" complete, now we can restore the packages into the cache for the target arch (as opposed to the runner arch)
       - name: update linuxkit cache for our arch
         id: cache_for_packages
         if: ${{ matrix.arch != 'amd64' }}  # because our runner arch is amd64; if that changes, this will have to change
@@ -112,7 +119,7 @@ jobs:
         run: |
           COMMIT_ID=$(git describe --abbrev=8 --always)
           echo "VERSION=0.0.0-pr$PR_ID-$COMMIT_ID" >> $GITHUB_ENV
-          echo "TAG=evebuild/danger:pr$PR_ID" >> $GITHUB_ENV
+          echo "TAG=evebuild/pr:$PR_ID" >> $GITHUB_ENV
           echo "ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       - name: Build EVE ${{ matrix.hv }}-${{ matrix.arch }}
@@ -130,7 +137,7 @@ jobs:
         run: |
           make cache-export ZARCH=${{ matrix.arch }} IMAGE=lfedge/eve:$VERSION-${{ matrix.hv }} OUTFILE=eve-${{ matrix.hv }}-${{ matrix.arch }}.tar IMAGE_NAME=$TAG-${{ matrix.hv }}-${{ matrix.arch }}
       - name: Upload EVE ${{ matrix.hv }}-${{ matrix.arch }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: eve-${{ matrix.hv }}-${{ matrix.arch }}
           path: eve-${{ matrix.hv }}-${{ matrix.arch }}.tar

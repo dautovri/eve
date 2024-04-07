@@ -241,6 +241,9 @@ func doUpdateContentTree(ctx *volumemgrContext, status *types.ContentTreeStatus)
 		if status.CurrentSize != currentSize || status.TotalSize != totalSize {
 			changed = true
 			status.CurrentSize = currentSize
+			if (status.TotalSize != 0) && (status.TotalSize != totalSize) {
+				log.Warnf("doUpdateContentTree: total size changed from %d to %d", status.TotalSize, totalSize)
+			}
 			status.TotalSize = totalSize
 			if status.TotalSize > 0 {
 				status.Progress = uint(100 * status.CurrentSize / status.TotalSize)
@@ -431,11 +434,12 @@ func doUpdateContentTree(ctx *volumemgrContext, status *types.ContentTreeStatus)
 		log.Functionf("doUpdateContentTree(%s) successfully loaded all blobs into CAS", status.Key())
 
 		// check if the image was created
-		if !lookupImageCAS(status.ReferenceID(), ctx.casClient) {
+		imgName := status.ReferenceID()
+		if !lookupImageCAS(imgName, ctx.casClient) {
 			log.Functionf("doUpdateContentTree(%s): image does not yet exist in CAS", status.Key())
 			return changed, false
 		}
-		log.Functionf("doUpdateContentTree(%s): image exists in CAS, Content Tree load is completely LOADED", status.Key())
+		log.Functionf("doUpdateContentTree(%s): image %v exists in CAS, Content Tree load is completely LOADED", status.Key(), imgName)
 		status.State = types.LOADED
 		status.CreateTime = time.Now()
 		// ContentTreeStatus.FileLocation has no meaning once everything is loaded
@@ -537,6 +541,7 @@ func doUpdateVol(ctx *volumemgrContext, status *types.VolumeStatus) (bool, bool)
 			status.TotalSize = int64(status.MaxVolSize)
 			status.CurrentSize = int64(status.MaxVolSize)
 			changed = true
+			log.Noticef("doUpdateVol(%s): creating blank volume with format %s", status.Key(), status.ContentFormat)
 			// Asynch preparation; ensure we have requested it
 			AddWorkPrepare(ctx, status)
 			return changed, false
@@ -588,7 +593,8 @@ func doUpdateVol(ctx *volumemgrContext, status *types.VolumeStatus) (bool, bool)
 			status.State != types.CREATING_VOLUME &&
 			status.SubState == types.VolumeSubStateInitial {
 
-			_, err := ctx.casClient.GetImageHash(ctStatus.ReferenceID())
+			imgName := ctStatus.ReferenceID()
+			_, err := ctx.casClient.GetImageHash(imgName)
 			if err != nil {
 				log.Functionf("doUpdateVol(%s): waiting for image create: %s", status.Key(), err.Error())
 				return changed, false
@@ -610,8 +616,9 @@ func doUpdateVol(ctx *volumemgrContext, status *types.VolumeStatus) (bool, bool)
 					status.Key(), status.DisplayName)
 				return changed, false
 			}
-			status.ReferenceName = ctStatus.ReferenceID()
+			status.ReferenceName = imgName
 			status.ContentFormat = ctStatus.Format
+			log.Noticef("doUpdateVol(%s): setting VolumeStatus.ContentFormat by ContentTree to %s", status.Key(), status.ContentFormat)
 			changed = true
 			// Asynch preparation; ensure we have requested it
 			AddWorkPrepare(ctx, status)

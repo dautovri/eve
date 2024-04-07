@@ -31,8 +31,10 @@
 | debug.enable.vga | boolean | false | allow VGA console on device |
 | debug.enable.ssh | authorized ssh key | empty string(ssh disabled) | allow ssh to EVE |
 | debug.enable.console | boolean | false | allow console access to EVE (reboot required to disable) |
-| debug.default.loglevel | string | info | min level saved in files on device |
-| debug.default.remote.loglevel | string | warning | min level sent to controller |
+| debug.default.loglevel | string | info | min level saved in files on device. Used logrus log levels as described here ["https://pkg.go.dev/github.com/sirupsen/logrus"]: panic, fatal, error, warning, info, debug and trace.
+| debug.syslog.loglevel | string | info | min level of the syslog messages saved in files on device. System default loglevel string representation should be used as described here ["https://man7.org/linux/man-pages/man3/syslog.3.html"]: emerg, alert, crit, err, warning, notice, info, debug. |
+| debug.kernel.loglevel | string | info | min level of the kernel messages saved in files on device. System default loglevel string representation should be used as described here ["https://man7.org/linux/man-pages/man3/syslog.3.html"]: emerg, alert, crit, err, warning, notice, info, debug. |
+| debug.default.remote.loglevel | string | warning | min level sent to controller. Should be used log levels as described in "debug.syslog.loglevel" settings. |
 | storage.dom0.disk.minusage.percent | integer percent | 20 | min. percent of persist partition reserved for dom0 |
 | storage.zfs.reserved.percent | integer percent | 20 | min. percent of persist partition reserved for zfs performance |
 | storage.apps.ignore.disk.check | boolean | false | Ignore disk usage check for Apps. Allows apps to create images bigger than available disk|
@@ -53,6 +55,7 @@
 | netdump.downloader.http.with.fieldvalue | boolean | false | include HTTP header field values in captured network traces for download requests (beware: may contain secrets, such as datastore credentials). |
 | network.switch.enable.arpsnoop | boolean | true | enable ARP Snooping on switch Network Instance, may need a device reboot to take effect |
 | wwan.query.visible.providers | bool | false | enable to periodically (once per hour) query the set of visible cellular service providers and publish them under WirelessStatus (for every modem) |
+| network.local.legacy.mac.address | bool | false | enables legacy MAC address generation for local network instances for those EVE nodes where changing MAC addresses in applications will lead to incorrect network configuration |
 
 In addition, there can be per-agent settings.
 The Per-agent settings begin with "agent.*agentname*.*setting*"

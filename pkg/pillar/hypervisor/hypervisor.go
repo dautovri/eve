@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	uuid "github.com/satori/go.uuid"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
 	"github.com/sirupsen/logrus"
@@ -27,6 +28,10 @@ type Hypervisor interface {
 	GetDomsCPUMem() (map[string]types.DomainMetric, error)
 
 	GetCapabilities() (*types.Capabilities, error)
+
+	CountMemOverhead(domainName string, domainUUID uuid.UUID, domainRAMSize int64, vmmMaxMem int64,
+		domainMaxCpus int64, domainVCpus int64, domainIoAdapterList []types.IoAdapter, aa *types.AssignableAdapters,
+		globalConfig *types.ConfigItemValueMap) (uint64, error)
 }
 
 type hypervisorDesc struct {

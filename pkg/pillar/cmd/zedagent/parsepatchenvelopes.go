@@ -6,7 +6,6 @@ package zedagent
 import (
 	"encoding/hex"
 	"fmt"
-	"os"
 
 	"crypto/sha256"
 
@@ -25,13 +24,6 @@ func parsePatchEnvelopesImpl(ctx *getconfigContext, config *zconfig.EdgeDevConfi
 	persistCacheFilepath string) {
 	log.Tracef("Parsing patchEnvelope from configuration")
 
-	// Remove previously created patch envelopes
-	// so that we will not have stale objects
-	if err := os.RemoveAll(persistCacheFilepath); err != nil {
-		log.Errorf("Failed to delete persistCacheFilepath %v", err)
-		return
-	}
-
 	// Store list of binary blobs which were created before
 	pc, err := persistcache.New(persistCacheFilepath)
 	if err != nil {
@@ -49,6 +41,7 @@ func parsePatchEnvelopesImpl(ctx *getconfigContext, config *zconfig.EdgeDevConfi
 			PatchID:     pe.GetUuid(),
 			Name:        pe.GetDisplayName(),
 			Version:     pe.GetVersion(),
+			State:       evePatchEnvelopeActionToState(pe.GetAction()),
 		}
 		for _, a := range pe.GetArtifacts() {
 			err := addBinaryBlobToPatchEnvelope(&peInfo, a, persistCacheFilepath)
@@ -157,4 +150,14 @@ func getBinaryBlobVolumeRef(artifact *zconfig.ExternalOpaqueBinaryBlob) (*types.
 		FileMetadata: artifact.GetBlobMetaData(),
 		ImageID:      artifact.GetImageId(),
 	}, nil
+}
+
+func evePatchEnvelopeActionToState(action zconfig.EVE_PATCH_ENVELOPE_ACTION) types.PatchEnvelopeState {
+	switch action {
+	case zconfig.EVE_PATCH_ENVELOPE_ACTION_STORE:
+		return types.PatchEnvelopeStateReady
+	case zconfig.EVE_PATCH_ENVELOPE_ACTION_ACTIVATE:
+		return types.PatchEnvelopeStateActive
+	}
+	return types.PatchEnvelopeStateError
 }

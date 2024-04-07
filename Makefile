@@ -295,7 +295,7 @@ DOCKER_GO = _() { $(SET_X); mkdir -p $(CURDIR)/.go/src/$${3:-dummy} ; mkdir -p $
 
 PARSE_PKGS=$(if $(strip $(EVE_HASH)),EVE_HASH=)$(EVE_HASH) DOCKER_ARCH_TAG=$(DOCKER_ARCH_TAG) KERNEL_TAG=$(KERNEL_TAG) ./tools/parse-pkgs.sh
 LINUXKIT=$(BUILDTOOLS_BIN)/linuxkit
-LINUXKIT_VERSION=bbd9b85fc153a9d64f839d37591b0dcbe5375407
+LINUXKIT_VERSION=3a0405298aab1632524a6ccd074969b417e1ee92
 LINUXKIT_SOURCE=https://github.com/linuxkit/linuxkit.git
 LINUXKIT_OPTS=$(if $(strip $(EVE_HASH)),--hash) $(EVE_HASH) $(if $(strip $(EVE_REL)),--release) $(EVE_REL)
 LINUXKIT_PKG_TARGET=build
@@ -345,7 +345,7 @@ ifeq ($(HV),kubevirt)
         ROOTFS_MAXSIZE_MB=450
 else
         #kube container will not be in non-kubevirt builds
-        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube|verification$$")
+        PKGS_$(ZARCH)=$(shell find pkg -maxdepth 1 -type d | grep -Ev "eve|alpine|sources|kube|external-boot-image|verification$$")
         ROOTFS_MAXSIZE_MB=250
 endif
 
@@ -392,8 +392,9 @@ currentversion:
 
 test: $(LINUXKIT) test-images-patches | $(DIST)
 	@echo Running tests on $(GOMODULE)
-	$(QUIET)$(DOCKER_GO) "gotestsum --jsonfile $(DOCKER_DIST)/results.json --junitfile $(DOCKER_DIST)/results.xml --raw-command -- go test -coverprofile=coverage.txt -covermode=atomic -json ./..." $(GOTREE) $(GOMODULE)
-	$(QUIET)$(DOCKER_GO) "cd \"$(GOTREE)\"; find ./ -type d \! -path ./vendor/\* -exec go test -fuzz=^Fuzz -run=^Fuzz -fuzztime=30s "{}" \;" $(GOTREE) $(GOMODULE)
+	make -C pkg/pillar test
+	cp pkg/pillar/results.json $(DIST)/
+	cp pkg/pillar/results.xml $(DIST)/
 	$(QUIET): $@: Succeeded
 
 # wrap command into DOCKER_GO and propagate it to the pillar's Makefile
@@ -407,13 +408,14 @@ pillar-%: $(GOBUILDER) | $(DIST)
 	$(QUIET): $@: Succeeded
 
 clean:
-	rm -rf $(DIST) images/*.yml
+	rm -rf $(DIST) images/out
 
 yetus:
 	@echo Running yetus
 	mkdir -p yetus-output
-	docker run --rm -v $(CURDIR):/src:delegated,z ghcr.io/apache/yetus:0.14.1 \
+	docker run --rm -v $(CURDIR):/src:delegated,z ghcr.io/apache/yetus:0.15.0 \
 		--basedir=/src \
+		--test-parallel=true \
 		--dirty-workspace \
 		--empty-patch \
 		--plugins=all \
@@ -522,7 +524,7 @@ run-grub: $(BIOS_IMG) $(UBOOT_IMG) $(EFI_PART) $(DEVICETREE_DTB) $(SWTPM)  GETTY
 	$(QEMU_SYSTEM) $(QEMU_OPTS) -drive format=vvfat,id=uefi-disk,label=EVE,file=fat:rw:$(EFI_PART)/..
 	$(QUIET): $@: Succeeded
 
-run-compose: images/version.yml
+run-compose: images/out/version.yml
 	# we regenerate this on every run, in case things changed
 	$(PARSE_PKGS) > tmp/images
 	docker-compose -f docker-compose.yml run storage-init sh -c 'rm -rf /run/* /config/* ; cp -Lr /conf/* /config/ ; echo IMGA > /run/eve.id'
@@ -636,10 +638,22 @@ $(ROOTFS)-%.img: $(ROOTFS_IMG)
 	@rm -f $@ && ln -s $(notdir $<) $@
 	$(QUIET): $@: Succeeded
 
-$(ROOTFS_TAR): images/rootfs-$(HV).yml | $(INSTALLER)
+$(ROOTFS_TAR): images/out/rootfs-$(HV)-$(PLATFORM).yml | $(INSTALLER)
 	$(QUIET): $@: Begin
 	./tools/makerootfs.sh tar -y $< -t $@ -d $(INSTALLER) -a $(ZARCH)
 	$(QUIET): $@: Succeeded
+ifdef KERNEL_IMAGE
+	# Consider this as a cry from the heart: enormous amount of time is
+	# wasted during kernel rebuild on every small testing change. Now any
+	# kernel image can be used by providing path to a file. You heard it
+	# right: path-to-a-file. No docker. Yay!
+	$(eval KIMAGE = $$(realpath $(KERNEL_IMAGE)))
+	@echo "Replace kernel image in \"$@\" with \"$(KIMAGE)\""
+	# Delete /boot/kernel kernel image
+	tar --delete -f "$@" boot/kernel
+	# Append new kernel image and rename
+	tar -P -u --transform="flags=r;s|$(KIMAGE)|/boot/kernel|" -f "$@" "$(KIMAGE)"
+endif
 
 $(ROOTFS_IMG): $(ROOTFS_TAR) | $(INSTALLER)
 	$(QUIET): $@: Begin
@@ -664,11 +678,6 @@ $(SBOM): $(ROOTFS_TAR) | $(INSTALLER)
 	# this all can go away, and we can read the rootfs.tar
 	# see https://github.com/anchore/syft/issues/1400
 	tar xf $< -C $(TMP_ROOTDIR) --exclude "dev/*"
-	# kernel-*.spdx.json are now generated in eve-kernel repo and are stored in docker  image.
-	# Manually extract them to unpacked rootfs.
-	# Later linuxkit will get a support for SBOM in OCI metadata and this step as well as manual run of
-	# syft will be deprecated
-	docker export $(shell docker create $(KERNEL_TAG) create) | tar xv -C $(TMP_ROOTDIR) --wildcards --no-anchored '*.spdx.json'
 	docker run -v $(TMP_ROOTDIR):/rootdir:ro -v $(CURDIR)/.syft.yaml:/syft.yaml:ro $(SYFT_IMAGE) -c /syft.yaml --base-path /rootdir /rootdir > $@
 	rm -rf $(TMP_ROOTDIR)
 	$(QUIET): $@: Succeeded
@@ -724,8 +733,8 @@ $(INSTALLER).iso: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(INSTALLER_IMG) $(CON
 	./tools/makeiso.sh $| $@ installer
 	$(QUIET): $@: Succeeded
 
-$(INSTALLER).net: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(INSTALLER_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(INSTALLER)
-	./tools/makenet.sh $| installer.img $@
+$(INSTALLER).net: $(EFI_PART) $(ROOTFS_TAR) $(ROOTFS_IMG) $(INITRD_IMG) $(INSTALLER_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(INSTALLER)
+	./tools/makenet.sh $| $(ROOTFS_TAR) installer.img $@
 	$(QUIET): $@: Succeeded
 
 $(LIVE).vdi: $(LIVE).raw
@@ -743,9 +752,9 @@ $(VERIFICATION).raw: $(BOOT_PART) $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(VERI
 	./tools/makeflash.sh "mkverification-raw-efi" -C 850 $| $@ "conf_win verification inventory_win"
 	$(QUIET): $@: Succeeded
 
-$(VERIFICATION).net: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(VERIFICATION_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(VERIFICATION)
+$(VERIFICATION).net: $(EFI_PART) $(ROOTFS_TAR) $(ROOTFS_IMG) $(INITRD_IMG) $(VERIFICATION_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(VERIFICATION)
 	./tools/prepare-platform.sh "$(PLATFORM)" "$(BUILD_DIR)" "$(VERIFICATION)" || :
-	./tools/makenet.sh $| verification.img $@
+	./tools/makenet.sh $| $(ROOTFS_TAR) verification.img $@
 
 $(VERIFICATION).iso: $(EFI_PART) $(ROOTFS_IMG) $(INITRD_IMG) $(VERIFICATION_IMG) $(CONFIG_IMG) $(PERSIST_IMG) | $(VERIFICATION)
 	./tools/prepare-platform.sh "$(PLATFORM)" "$(BUILD_DIR)" "$(VERIFICATION)" || :
@@ -757,6 +766,14 @@ pkgs: RESCAN_DEPS=
 pkgs: build-tools $(PKGS)
 	@echo Done building packages
 
+pkg/external-boot-image/build.yml: pkg/external-boot-image/build.yml.in
+	$(QUIET)tools/compose-external-boot-image-yml.sh $< $@ $(shell echo ${KERNEL_TAG} | cut -d':' -f2) $(shell $(LINUXKIT) pkg show-tag pkg/xen-tools | cut -d':' -f2)
+pkg/external-boot-image: pkg/external-boot-image/build.yml
+pkg/kube: pkg/external-boot-image
+	$(MAKE) eve-external-boot-image
+	$(MAKE) cache-export IMAGE=$(shell $(LINUXKIT) pkg show-tag pkg/external-boot-image) OUTFILE=pkg/kube/external-boot-image.tar && \
+	$(MAKE) eve-kube && rm -f pkg/kube/external-boot-image.tar && rm -f pkg/external-boot-image/build.yml
+	$(QUIET): $@: Succeeded
 pkg/pillar: pkg/dnsmasq pkg/gpt-tools pkg/dom0-ztools eve-pillar
 	$(QUIET): $@: Succeeded
 pkg/xen-tools: pkg/uefi eve-xen-tools
@@ -770,7 +787,7 @@ $(RUNME) $(BUILD_YML):
 EVE_ARTIFACTS=$(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(PERSIST_IMG) $(INITRD_IMG) $(INSTALLER_IMG) $(ROOTFS_IMG) $(SBOM) $(BSP_IMX_PART) fullname-rootfs $(BOOT_PART)
 eve: $(INSTALLER) $(EVE_ARTIFACTS) current $(RUNME) $(BUILD_YML) | $(BUILD_DIR)
 	$(QUIET): "$@: Begin: EVE_REL=$(EVE_REL), HV=$(HV), LINUXKIT_PKG_TARGET=$(LINUXKIT_PKG_TARGET)"
-	cp images/*.yml $|
+	cp images/out/*.yml $|
 	$(PARSE_PKGS) pkg/eve/Dockerfile.in > $|/Dockerfile
 	$(LINUXKIT) $(DASH_V) pkg $(LINUXKIT_PKG_TARGET) --platforms linux/$(ZARCH) --hash-path $(CURDIR) --hash $(ROOTFS_VERSION)-$(HV) --docker $(if $(strip $(EVE_REL)),--release) $(EVE_REL)$(if $(strip $(EVE_REL)),-$(HV)) $(FORCE_BUILD) $|
 	$(QUIET)if [ -n "$(EVE_REL)" ] && [ $(HV) = $(HV_DEFAULT) ]; then \
@@ -781,7 +798,7 @@ eve: $(INSTALLER) $(EVE_ARTIFACTS) current $(RUNME) $(BUILD_YML) | $(BUILD_DIR)
 VERIFICATION_ARTIFACTS=$(BIOS_IMG) $(EFI_PART) $(CONFIG_IMG) $(PERSIST_IMG) $(INITRD_IMG) $(VERIFICATION_IMG) $(ROOTFS_IMG) $(SBOM) $(BSP_IMX_PART) fullname-rootfs $(BOOT_PART)
 verification: $(VERIFICATION_ARTIFACTS) current $(VERIFICATION) | $(BUILD_DIR)
 	$(QUIET): "$@: Begin: EVE_REL=$(EVE_REL), HV=$(HV), LINUXKIT_PKG_TARGET=$(LINUXKIT_PKG_TARGET)"
-	cp images/*.yml $|
+	cp images/out/*.yml $|
 	cp pkg/verification/runme.sh pkg/verification/build.yml $|
 	$(PARSE_PKGS) pkg/verification/Dockerfile.in > $|/Dockerfile
 	$(LINUXKIT) $(DASH_V) pkg $(LINUXKIT_PKG_TARGET) --platforms linux/$(ZARCH) --hash-path $(CURDIR) --hash $(ROOTFS_VERSION)-$(HV) --docker $(if $(strip $(EVE_REL)),--release) $(EVE_REL)$(if $(strip $(EVE_REL)),-$(HV)) $(FORCE_BUILD) $|
@@ -824,6 +841,9 @@ cache-export-docker-load-all: $(LINUXKIT) $(addsuffix -cache-export-docker-load,
 
 proto-vendor:
 	@$(DOCKER_GO) "cd pkg/pillar ; go mod vendor" $(CURDIR) proto
+
+bump-eve-api:
+	find . -type f -name "go.mod" -exec grep -q 'github.com/lf-edge/eve-api/go' {} \; -execdir go get -u github.com/lf-edge/eve-api/go \; -execdir go mod tidy \; -execdir go mod vendor \;
 
 .PHONY: proto-api-%
 
@@ -928,13 +948,16 @@ endif
 	$(QUIET)$(PARSE_PKGS) $< > $@
 	$(QUIET): $@: Succeeded
 
-# If DEV=y and file pkg/my_package/build-dev.yml returns the path to that file.
-# If RSTATS=y and file pkg/my_package/build-rstats.yml returns the path to that file.
+# If DEV=y and file pkg/my_package/build-dev.yml exists, returns the path to that file.
+# If RSTATS=y and file pkg/my_package/build-rstats.yml exists, returns the path to that file.
+# If HV=kubevirt and file pkg/my_package/build-kubevirt.yml exists, returns the path to that file.
 # Ortherwise returns pkg/my_package/build.yml.
-get_pkg_build_yml = $(if $(filter y,$(RSTATS)), $(call get_pkg_build_rstats_yml,$1), $(call get_pkg_build_def_yml,$1))
-get_pkg_build_def_yml = $(if $(filter y,$(DEV)),$(call get_pkg_build_dev_yml,$1),build.yml)
+get_pkg_build_yml = $(if $(filter kubevirt,$(HV)), $(call get_pkg_build_kubevirt_yml,$1), \
+                    $(if $(filter y,$(RSTATS)), $(call get_pkg_build_rstats_yml,$1), \
+                    $(if $(filter y,$(DEV)), $(call get_pkg_build_dev_yml,$1), build.yml)))
 get_pkg_build_dev_yml = $(if $(wildcard pkg/$1/build-dev.yml),build-dev.yml,build.yml)
 get_pkg_build_rstats_yml = $(if $(wildcard pkg/$1/build-rstats.yml),build-rstats.yml,build.yml)
+get_pkg_build_kubevirt_yml = $(if $(wildcard pkg/$1/build-kubevirt.yml),build-kubevirt.yml,build.yml)
 
 eve-%: pkg/%/Dockerfile build-tools $(RESCAN_DEPS)
 	$(QUIET): "$@: Begin: LINUXKIT_PKG_TARGET=$(LINUXKIT_PKG_TARGET)"
@@ -949,11 +972,13 @@ eve-%: pkg/%/Dockerfile build-tools $(RESCAN_DEPS)
 	fi
 	$(QUIET): "$@: Succeeded (intermediate for pkg/%)"
 
-images/rootfs-%.yml.in: images/rootfs.yml.in FORCE
-	$(QUIET)tools/compose-image-yml.sh $< $@ "$(ROOTFS_VERSION)-$*-$(ZARCH)" $(HV)
+images/out:
+	mkdir -p $@
 
-images-patches := $(wildcard images/*.yq)
-test-images-patches: $(images-patches:%.yq=%)
+images/out/rootfs-%.yml.in: images/rootfs.yml.in images/out FORCE
+	$(QUIET)tools/compose-image-yml.sh -b $< -v "$(ROOTFS_VERSION)-$*-$(ZARCH)" -o $@ -h $(HV) $(patsubst %,images/modifiers/%.yq,$(subst -, ,$*))
+
+test-images-patches: $(patsubst images/modifiers/%.yq,images/out/rootfs-%.yml.in,$(wildcard images/modifiers/*.yq))
 
 $(ROOTFS_FULL_NAME)-adam-kvm-$(ZARCH).$(ROOTFS_FORMAT): $(ROOTFS_FULL_NAME)-kvm-adam-$(ZARCH).$(ROOTFS_FORMAT)
 $(ROOTFS_FULL_NAME)-kvm-adam-$(ZARCH).$(ROOTFS_FORMAT): fullname-rootfs $(SSH_KEY)
@@ -1002,6 +1027,9 @@ help:
 	@echo "   proto-vendor   update vendored API in packages that require it (e.g. pkg/pillar)"
 	@echo "   shell          drop into docker container setup for Go development"
 	@echo "   yetus          run Apache Yetus to check the quality of the source tree"
+	@echo
+	@echo "Seldom used maintenance and development targets:"
+	@echo "   bump-eve-api   bump eve-api in all subprojects"
 	@echo
 	@echo "Commonly used build targets:"
 	@echo "   build-tools      builds linuxkit utilities and installs under build-tools/bin"

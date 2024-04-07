@@ -4,6 +4,7 @@
 package devicenetwork_test
 
 import (
+	"errors"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -97,6 +98,7 @@ func createDeviceNetworkStatus() types.DeviceNetworkStatus {
 	deviceNetworkStatusPorts := make([]types.NetworkPortStatus, len(mockInterface))
 	for i := range deviceNetworkStatusPorts {
 		deviceNetworkStatusPorts[i].IfName = mockInterface[i].Attrs.IfName
+		deviceNetworkStatusPorts[i].IsL3Port = true
 		deviceNetworkStatusPorts[i].DNSServers = mockInterface[i].DNS.DNSServers
 		addrInfos := make([]types.AddrInfo, len(mockInterface[i].IPAddrs))
 		for j := range mockInterface[i].IPAddrs {
@@ -197,5 +199,47 @@ func TestResolveWithPortsLambda(t *testing.T) {
 		t.Errorf(
 			"more calls to resolverFunc than dnsMaxParallelRequests+1, but first call should already succeed",
 		)
+	}
+}
+
+func TestResolveWithPortsLambdaWithErrors(t *testing.T) {
+	t.Parallel()
+
+	expectedIP := net.IP{1, 2, 3, 4}
+	resolverFunc := func(domain string, dnsServer net.IP, srcIP net.IP) ([]devicenetwork.DNSResponse, error) {
+		if srcIP.Equal(net.IP{192, 168, 0, 1}) && domain == "example.com" {
+			return []devicenetwork.DNSResponse{
+				{
+					IP:  expectedIP,
+					TTL: 3600,
+				},
+			}, nil
+		}
+		return nil, errors.New("resolver failed")
+	}
+
+	deviceNetworkStatus := createDeviceNetworkStatus()
+	res, err := devicenetwork.ResolveWithPortsLambda(
+		"example.com",
+		deviceNetworkStatus,
+		resolverFunc,
+	)
+	if err != nil {
+		t.Errorf("expected no error, but got: %+v", err)
+	}
+	if !res[0].IP.Equal(expectedIP) {
+		t.Errorf("expected IP 1.2.3.4, but got: %+v", res)
+	}
+
+	res, err = devicenetwork.ResolveWithPortsLambda(
+		"resolver-should-fail.com",
+		deviceNetworkStatus,
+		resolverFunc,
+	)
+	if err == nil {
+		t.Error("expected error, but got nil")
+	}
+	if len(res) > 0 {
+		t.Errorf("expected empty response, but got: %+v", res)
 	}
 }

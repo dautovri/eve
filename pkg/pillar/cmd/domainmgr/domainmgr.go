@@ -10,6 +10,7 @@ package domainmgr
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -23,10 +24,12 @@ import (
 
 	"github.com/containerd/cgroups"
 	"github.com/google/go-cmp/cmp"
+	envp "github.com/hashicorp/go-envparse"
 	zconfig "github.com/lf-edge/eve-api/go/config"
 	"github.com/lf-edge/eve/pkg/pillar/agentbase"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/lf-edge/eve/pkg/pillar/canbus"
 	"github.com/lf-edge/eve/pkg/pillar/cas"
 	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/containerd"
@@ -1332,7 +1335,8 @@ func handleCreate(ctx *domainContext, key string, config *types.DomainConfig) {
 }
 
 // doAssignAdaptersToDomain assigns IO adapters to the newly created domain.
-// Note that the adapters are already reserved for the domain using reserveAdapters (UsedByUUID is set).
+// The adapters are reserved here for the domain
+// UsedByUUID is already set in reserveAdapters
 func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 	status *types.DomainStatus) error {
 
@@ -1374,7 +1378,7 @@ func doAssignIoAdaptersToDomain(ctx *domainContext, config types.DomainConfig,
 				log.Functionf("Assigning %s (%s) to %s",
 					ib.Phylabel, ib.UsbAddr, status.DomainName)
 				assignmentsUsb = addNoDuplicate(assignmentsUsb, ib.UsbAddr)
-			} else if ib.PciLong != "" && !ib.IsPCIBack {
+			} else if ib.PciLong != "" && !ib.IsPCIBack && !ib.KeepInHost {
 				log.Functionf("Assigning %s (%s) to %s",
 					ib.Phylabel, ib.PciLong, status.DomainName)
 				assignmentsPci = addNoDuplicate(assignmentsPci, ib.PciLong)
@@ -1684,29 +1688,6 @@ func doActivateTail(ctx *domainContext, status *types.DomainStatus,
 		status.UUIDandVersion, status.DisplayName)
 }
 
-// VLAN filtering could have been enabled on the bridge immediately after
-// it's creation in zedrouter. For some strange reason netlink
-// throws back error stating that the device is busy if enabling the vlan
-// filtering is tried immediately after bridge creation.
-// We can either loop retrying in zedrouter or enable it when needed in domainmgr
-func enableVlanFiltering(bridgeName string) error {
-	bridge, err := netlink.LinkByName(bridgeName)
-	if err != nil {
-		log.Errorf("enableVlanFiltering: LinkByName failed for %s: %s", bridgeName, err)
-		return err
-	}
-	if !*bridge.(*netlink.Bridge).VlanFiltering {
-		// Enable VLAN filtering on bridge
-		if err := netlink.BridgeSetVlanFiltering(bridge, true); err != nil {
-			err = fmt.Errorf("enableVlanFiltering on %s failed: %w",
-				bridgeName, err)
-			log.Error(err)
-			return err
-		}
-	}
-	return nil
-}
-
 // shutdown and wait for the domain to go away; if that fails destroy and wait
 func doInactivate(ctx *domainContext, status *types.DomainStatus, impatient bool) {
 
@@ -1866,7 +1847,6 @@ func unmountContainers(ctx *domainContext, diskStatusList []types.DiskStatus, fo
 
 // releaseAdapters is called when the domain is done with the device and we
 // clear UsedByUUID
-// In addition, if KeepInHost is set, we move it back to the host.
 // If status is set, any errors are recorded in status
 func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 	myUUID uuid.UUID, status *types.DomainStatus) {
@@ -1897,7 +1877,7 @@ func releaseAdapters(ctx *domainContext, ioAdapterList []types.IoAdapter,
 					myUUID)
 				continue
 			}
-			if ib.PciLong != "" && ib.KeepInHost && ib.IsPCIBack {
+			if ib.PciLong != "" && ib.IsPCIBack {
 				log.Functionf("releaseAdapters removing %s (%s) from %s",
 					ib.Phylabel, ib.PciLong, myUUID)
 				assignments = addNoDuplicate(assignments, ib.PciLong)
@@ -2609,17 +2589,27 @@ func fetchCloudInit(ctx *domainContext,
 // Key1=Val1
 // Key2=Val2 ...
 func parseEnvVariablesFromCloudInit(envPairs []string) (map[string]string, error) {
-
-	envList := make(map[string]string, 0)
+	var envStr string
 	for _, v := range envPairs {
 		pair := strings.SplitN(v, "=", 2)
 		if len(pair) != 2 {
-			errStr := fmt.Sprintf("Variable \"%s\" not defined properly\nKey value pair should be delimited by \"=\"", pair[0])
-			return nil, errors.New(errStr)
+			// We will check syntax errors later
+			envStr += v + "\n"
+			continue
 		}
-		envList[pair[0]] = pair[1]
+		// Trim off (i.e., remove leading and trailing) spaces and
+		// double quotes, so we allow declarations like "VAR=VALUE"
+		key := strings.Trim(pair[0], " \"")
+		value := strings.Trim(pair[1], " \"")
+		envStr += key + "=\"" + value + "\"\n"
 	}
 
+	// Use go-envparse to parse all environment variables and check for
+	// syntax errors. Fail if any invalid declaration is found
+	envList, err := envp.Parse(bytes.NewReader([]byte(envStr)))
+	if err != nil {
+		return nil, fmt.Errorf("Error processing environment variables: %s", err)
+	}
 	return envList, nil
 }
 
@@ -2829,11 +2819,30 @@ func handlePhysicalIOAdapterListImpl(ctxArg interface{}, key string,
 					}
 					aa.AddOrUpdateIoBundle(log, vfIb)
 				}
+			} else if ib.Type == types.IoVCAN {
+				// Initialize (create and enable) Virtual CAN device
+				err := setupVCAN(ib)
+				if err != nil {
+					err = fmt.Errorf("setupVCAN: %w", err)
+					log.Error(err)
+					ib.Error = err.Error()
+					ib.ErrorTime = time.Now()
+				}
+			} else if ib.Type == types.IoCAN {
+				// Initialize physical CAN device
+				err := setupCAN(ib)
+				if err != nil {
+					err = fmt.Errorf("setupCAN: %w", err)
+					log.Error(err)
+					ib.Error = err.Error()
+					ib.ErrorTime = time.Now()
+				}
 			}
 		}
 		log.Functionf("handlePhysicalIOAdapterListImpl: initialized to get len %d",
 			len(aa.IoBundleList))
 
+		aa.CheckBadUSBBundles()
 		// check for mismatched PCI-ids and assignment groups and mark as errors
 		aa.CheckBadAssignmentGroups(log, hyper.PCISameController)
 		for i := range aa.IoBundleList {
@@ -2879,6 +2888,7 @@ func handlePhysicalIOAdapterListImpl(ctxArg interface{}, key string,
 				"add/modify: %+v", phyAdapter.Phylabel, ib)
 			aa.AddOrUpdateIoBundle(log, *ib)
 
+			aa.CheckBadUSBBundles()
 			// check for mismatched PCI-ids and assignment groups and mark as errors
 			aa.CheckBadAssignmentGroups(log, hyper.PCISameController)
 			// Lookup since it could have changed
@@ -3014,13 +3024,16 @@ func updatePortAndPciBackIoBundle(ctx *domainContext, ib *types.IoBundle) (chang
 		if ib.Type == types.IoNetEthPF {
 			keepInHost = true
 		}
+		if ib.Type == types.IoCAN || ib.Type == types.IoVCAN {
+			keepInHost = true
+		}
 	}
 
 	log.Functionf("updatePortAndPciBackIoBundle(%d %s %s) isPort %t keepInHost %t members %d",
 		ib.Type, ib.Phylabel, ib.AssignmentGroup, isPort, keepInHost, len(list))
 	anyChanged := false
 	for _, ib := range list {
-		if ib.UsbAddr != "" {
+		if ib.UsbAddr != "" || ib.UsbProduct != "" {
 			// this is usb device forwarding, so usbmanager cares for not passing through network devices
 			continue
 		}
@@ -3112,13 +3125,9 @@ func updatePortAndPciBackIoMember(ctx *domainContext, ib *types.IoBundle, isPort
 			log.Noticef("Not assigning %s (%s) to pciback due to Testing",
 				ib.Phylabel, ib.PciLong)
 		} else if ib.PciLong != "" && ib.UsbAddr == "" {
-			log.Noticef("Assigning %s (%s) to pciback",
+			log.Noticef("Assigning %s (%s) later to pciback",
 				ib.Phylabel, ib.PciLong)
-			err := hyper.PCIReserve(ib.PciLong)
-			if err != nil {
-				return changed, err
-			}
-			ib.IsPCIBack = true
+
 			changed = true
 		}
 	}
@@ -3320,6 +3329,36 @@ func removeUSBfromKernel() bool {
 		}
 	}
 	return ret
+}
+
+// Initialize (create and enable) Virtual CAN device
+func setupVCAN(ib *types.IoBundle) error {
+	vcan, err := canbus.AddVCANLink(ib.Ifname)
+	if err != nil {
+		return err
+	}
+	err = canbus.LinkSetUp(vcan)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Initialize physical CAN device
+func setupCAN(ib *types.IoBundle) error {
+	canIf, err := canbus.GetCANLink(ib.Ifname)
+	if err != nil {
+		return err
+	}
+	err = canbus.SetupCAN(canIf, ib.Cbattr)
+	if err != nil {
+		return err
+	}
+	err = canbus.LinkSetUp(canIf)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func doModprobe(driver string, add bool) error {

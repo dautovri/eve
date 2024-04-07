@@ -25,6 +25,7 @@ nav:
   - 'Verifying EVE-OS': 'docs/HARDWARE-VERIFICATION.md'
   - 'Booting EVE': 'docs/BOOTING.md'
   - Communications: 'docs/COMMS.md'
+  - 'CAN Bus': 'docs/CANBus.md'
   - Registration: 'docs/REGISTRATION.md'
   - 'Update base image': 'docs/BASEIMAGE-UPDATE.md'
   - Build-tools: 'build-tools/ver-update/README.md'
@@ -45,10 +46,13 @@ nav:
   - CI-CD: 'docs/CI-CD.md'
   - FAQ: 'docs/FAQ.md'
   - Networking:
+      - 'Overview': 'docs/NETWORKING.md'
       - 'Device Connectivity': 'docs/DEVICE-CONNECTIVITY.md'
+      - 'Application Connectivity': 'docs/APP-CONNECTIVITY.md'
       - 'Network ACLS': 'docs/NETWORK-ACLS.md'
-      - 'Network Models': 'docs/NETWORK-MODELS.md'
-      - Wireless: 'docs/WIRELESS.md'
+      - 'Wireless': 'docs/WIRELESS.md'
+      - 'NIM microservice': 'pkg/pillar/docs/nim.md'
+      - 'zedrouter microservice': 'pkg/pillar/docs/zedrouter.md'
       - 'wwan microservice': 'pkg/wwan/README.md'
   - 'ECO Initialization':
       - Initialization: 'docs/ECO-INIT.md'

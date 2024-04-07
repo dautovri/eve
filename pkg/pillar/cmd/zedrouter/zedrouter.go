@@ -23,7 +23,9 @@
 package zedrouter
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"flag"
 	"fmt"
 	"log"
@@ -44,6 +46,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/nireconciler"
 	"github.com/lf-edge/eve/pkg/pillar/nistate"
 	"github.com/lf-edge/eve/pkg/pillar/objtonum"
+	"github.com/lf-edge/eve/pkg/pillar/persistcache"
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
@@ -80,8 +83,9 @@ type zedrouter struct {
 	runCtx context.Context
 
 	// CLI options
-	versionPtr        *bool
-	enableArpSnooping bool // enable/disable switch NI arp snooping
+	versionPtr         *bool
+	enableArpSnooping  bool // enable/disable switch NI arp snooping
+	localLegacyMACAddr bool // switch to legacy MAC address generation
 
 	agentStartTime     time.Time
 	receivedConfigTime time.Time
@@ -105,6 +109,7 @@ type zedrouter struct {
 	bridgeNumAllocator  *objtonum.Allocator
 	appIntfNumPublisher *objtonum.ObjNumPublisher
 	appIntfNumAllocator map[string]*objtonum.Allocator // key: network instance UUID as string
+	appMACGeneratorMap  objtonum.Map
 
 	// Info published to application via metadata server
 	subLocationInfo pubsub.Subscription
@@ -180,8 +185,13 @@ type zedrouter struct {
 
 	patchEnvelopes      *PatchEnvelopes
 	patchEnvelopesUsage *generics.LockedMap[string, types.PatchEnvelopeUsage]
+	peUsagePersist      *persistcache.PersistCache
 
 	pubPatchEnvelopesUsage pubsub.Publication
+
+	// Kubernetes networking
+	withKubeNetworking bool
+	cniRequests        chan *rpcRequest
 }
 
 // AddAgentSpecificCLIFlags adds CLI options
@@ -197,6 +207,7 @@ func Run(ps *pubsub.PubSub, logger *logrus.Logger, log *base.LogObject, args []s
 
 		patchEnvelopesUsage: generics.NewLockedMap[string, types.PatchEnvelopeUsage](),
 	}
+
 	agentbase.Init(&zedrouter, logger, log, agentName,
 		agentbase.WithArguments(args))
 
@@ -225,8 +236,34 @@ func (z *zedrouter) init() (err error) {
 
 	z.patchEnvelopes = NewPatchEnvelopes(z.log, z.pubSub)
 
+	z.withKubeNetworking = base.IsHVTypeKube()
+	z.cniRequests = make(chan *rpcRequest)
+
 	gcp := *types.DefaultConfigItemValueMap()
 	z.appContainerStatsInterval = gcp.GlobalValueInt(types.AppContainerStatsInterval)
+
+	z.peUsagePersist, err = persistcache.New(types.PersistCachePatchEnvelopesUsage)
+	if err != nil {
+		return err
+	}
+
+	// restore cached patchEnvelopeUsage counters
+	for _, key := range z.peUsagePersist.Objects() {
+		cached, err := z.peUsagePersist.Get(key)
+		if err != nil {
+			return err
+		}
+		buf := bytes.NewBuffer(cached)
+		dec := gob.NewDecoder(buf)
+
+		var peUsage types.PatchEnvelopeUsage
+
+		if err := dec.Decode(&peUsage); err != nil {
+			return err
+		}
+
+		z.patchEnvelopesUsage.Store(key, peUsage)
+	}
 
 	if err = z.ensureDir(runDirname); err != nil {
 		return err
@@ -256,7 +293,8 @@ func (z *zedrouter) init() (err error) {
 		z.log, agentName, z.zedcloudMetrics)
 	z.reachProber = controllerReachProber
 	z.niReconciler = nireconciler.NewLinuxNIReconciler(z.log, z.logger, z.networkMonitor,
-		z.makeMetadataHandler(), true, true)
+		z.makeMetadataHandler(), true, true,
+		z.withKubeNetworking)
 
 	z.initNumberAllocators()
 	return nil
@@ -269,6 +307,16 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 	}
 	z.log.Noticef("Starting %s", agentName)
 
+	if base.IsHVTypeKube() {
+		if err = z.runRPCServer(); err != nil {
+			return err
+		}
+	}
+
+	// Run a periodic timer so we always update StillRunning
+	stillRunning := time.NewTicker(25 * time.Second)
+	z.pubSub.StillRunning(agentName, warningTime, errorTime)
+
 	// Wait for initial GlobalConfig.
 	if err = z.subGlobalConfig.Activate(); err != nil {
 		return err
@@ -278,7 +326,9 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 		select {
 		case change := <-z.subGlobalConfig.MsgChan():
 			z.subGlobalConfig.ProcessChange(change)
+		case <-stillRunning.C:
 		}
+		z.pubSub.StillRunning(agentName, warningTime, errorTime)
 	}
 	z.log.Noticef("Processed GlobalConfig")
 
@@ -289,10 +339,6 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 		return err
 	}
 	z.log.Noticef("Received device UUID")
-
-	// Run a periodic timer so we always update StillRunning
-	stillRunning := time.NewTicker(25 * time.Second)
-	z.pubSub.StillRunning(agentName, warningTime, errorTime)
 
 	// Timer used to retry failed configuration
 	z.retryTimer = time.NewTimer(1 * time.Second)
@@ -487,6 +533,7 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 						appKey, vif.NetAdapterName)
 					continue
 				}
+
 				for i := range appStatus.AppNetAdapterList {
 					adapterStatus := &appStatus.AppNetAdapterList[i]
 					if adapterStatus.Name != vif.NetAdapterName {
@@ -516,6 +563,12 @@ func (z *zedrouter) run(ctx context.Context) (err error) {
 				z.doUpdateNIUplink(probeUpdate.SelectedUplinkLL, status, *config)
 			}
 			z.pubSub.CheckMaxTimeTopic(agentName, "probeUpdates", start,
+				warningTime, errorTime)
+
+		case req := <-z.cniRequests:
+			start := time.Now()
+			z.handleRPC(req)
+			z.pubSub.CheckMaxTimeTopic(agentName, "handleRPC", start,
 				warningTime, errorTime)
 
 		case <-z.retryTimer.C:
@@ -910,7 +963,7 @@ func (z *zedrouter) processNIReconcileStatus(recStatus nireconciler.NIReconcileS
 			changed = true
 		}
 	} else {
-		if niStatus.HasError() {
+		if niStatus.HasError() && !niStatus.IPConflict {
 			niStatus.ClearError()
 			changed = true
 		}
@@ -1170,7 +1223,6 @@ func (z *zedrouter) publishNetworkInstanceMetricsAll(nms *types.NetworkMetrics) 
 		if err != nil {
 			z.log.Errorf("publishNetworkInstanceMetricsAll failed: %v", err)
 		}
-		z.publishNetworkInstanceStatus(&status)
 	}
 }
 
@@ -1181,17 +1233,19 @@ func (z *zedrouter) createNetworkInstanceMetrics(status *types.NetworkInstanceSt
 		UUIDandVersion: status.UUIDandVersion,
 		DisplayName:    status.DisplayName,
 		Type:           status.Type,
+		BridgeName:     status.BridgeName,
 	}
 	netMetrics := types.NetworkMetrics{}
-	// Update status.VifMetricMap and get bridge metrics as a sum of all VIF metrics.
-	brNetMetric := status.UpdateNetworkMetrics(z.log, nms)
-	// Add metrics of the bridge interface itself into brNetMetric.
-	status.UpdateBridgeMetrics(z.log, nms, brNetMetric)
-
-	// XXX For some strange reason we do not include VIFs into the returned
-	// NetworkInstanceMetrics.
-	netMetrics.MetricList = []types.NetworkMetric{*brNetMetric}
+	if bridgeMetrics, found := nms.LookupNetworkMetrics(status.BridgeName); found {
+		netMetrics.MetricList = append(netMetrics.MetricList, bridgeMetrics)
+	}
+	for _, vif := range status.Vifs {
+		if vifMetrics, found := nms.LookupNetworkMetrics(vif.Name); found {
+			netMetrics.MetricList = append(netMetrics.MetricList, vifMetrics)
+		}
+	}
 	niMetrics.NetworkMetrics = netMetrics
+
 	if status.WithUplinkProbing() {
 		probeMetrics, err := z.uplinkProber.GetProbeMetrics(status.UUID)
 		if err == nil {
@@ -1394,6 +1448,18 @@ func (z *zedrouter) publishPatchEnvelopesUsage() {
 		if err != nil {
 			z.log.Errorf("publishPatchEnvelopesUsage failed: %v", err)
 		}
+
+		// save peUsage in persistcache
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err = enc.Encode(peUsage); err != nil {
+			z.log.Errorf("publishPatchEnvelopesUsage failed to encode peUsage: %v", err)
+		}
+		_, err = z.peUsagePersist.Put(key, buf.Bytes())
+		if err != nil {
+			z.log.Errorf("publishPatchEnvelopesUsage failed to store usage: %v", err)
+		}
+
 		return true
 	}
 	z.patchEnvelopesUsage.Range(publishFn)

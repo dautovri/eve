@@ -324,7 +324,9 @@ func VerifyAllIntf(ctx *ZedCloudContext, url string, requiredSuccessCount uint,
 	// that was needed to achieve requiredSuccessCount.
 	var workingMgmtCost uint8
 
-	intfs := types.GetAllPortsSortedCost(*ctx.DeviceNetworkStatus, iteration)
+	// A small set of verification checks is run even for L2-only interfaces
+	// (link presence, admin status, etc.)
+	intfs := types.GetAllPortsSortedCost(*ctx.DeviceNetworkStatus, false, iteration)
 	ctxWork, cancel := GetContextForAllIntfFunctions(ctx)
 	defer cancel()
 
@@ -380,8 +382,10 @@ func VerifyAllIntf(ctx *ZedCloudContext, url string, requiredSuccessCount uint,
 			var noAddrErr *types.IPAddrNotAvailError
 			if errors.As(err, &noAddrErr) {
 				// Interface link exists and is UP but does not have any IP address assigned.
-				// This is expected with app-shared interface and DhcpTypeNone.
-				if !portStatus.IsMgmt && portStatus.Dhcp == types.DhcpTypeNone {
+				// This is expected for L2-only interfaces and also for app-shared interfaces
+				// configured with DhcpTypeNone.
+				if !portStatus.IsL3Port ||
+					(!portStatus.IsMgmt && portStatus.Dhcp == types.DhcpTypeNone) {
 					verifyRV.IntfStatusMap.RecordSuccess(intf)
 					continue
 				}
@@ -1058,19 +1062,11 @@ func SendOnIntf(workContext context.Context, ctx *ZedCloudContext, destURL strin
 				continue
 			}
 
-			if connState.OCSPResponse == nil ||
-				!stapledCheck(log, connState) {
-
-				if connState.OCSPResponse == nil {
-					// XXX remove debug check
-					log.Tracef("no OCSP response for %s\n",
-						reqURL)
-				}
-				errStr := fmt.Sprintf("OCSP stapled check failed for %s",
-					reqURL)
-
-				//XXX OSCP is not implemented in cloud side so
-				// commenting out it for now.
+			if ok, err := stapledCheck(log, connState); !ok {
+				errStr := fmt.Sprintf("OCSP stapled check failed for %s: %s",
+					reqURL, err)
+				// XXX OSCP is not implemented in controller
+				// so commenting out it for now.
 				if false {
 					log.Errorln(errStr)
 					// Inform ledmanager about broken cloud connectivity

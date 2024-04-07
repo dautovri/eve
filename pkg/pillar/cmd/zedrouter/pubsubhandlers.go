@@ -7,6 +7,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/lf-edge/eve/pkg/pillar/agentlog"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils/generics"
 )
 
 func (z *zedrouter) handleRestart(ctxArg interface{}, restartCounter int) {
@@ -51,6 +52,7 @@ func (z *zedrouter) handleGlobalConfigImpl(ctxArg interface{}, key string,
 			z.metricInterval = metricInterval
 		}
 		z.enableArpSnooping = gcp.GlobalValueBool(types.EnableARPSnoop)
+		z.localLegacyMACAddr = gcp.GlobalValueBool(types.NetworkLocalLegacyMACAddress)
 		z.niReconciler.ApplyUpdatedGCP(z.runCtx, *gcp)
 	}
 	z.log.Functionf("handleGlobalConfigImpl done for %s", key)
@@ -106,6 +108,10 @@ func (z *zedrouter) handleDNSImpl(ctxArg interface{}, key string,
 		z.initReconcileDone = true
 	}
 
+	// A new IP address may have been assigned to a device port, or a previously existing
+	// one may have been removed, potentially creating or resolving an IP conflict.
+	z.checkAllNetworkInstanceIPConflicts()
+
 	// Update uplink config for network instances.
 	// Also handle (dis)appearance of uplink interfaces.
 	// Note that even if uplink interface disappears, we do not revert activated NI.
@@ -115,6 +121,10 @@ func (z *zedrouter) handleDNSImpl(ctxArg interface{}, key string,
 		niConfig := z.lookupNetworkInstanceConfig(key)
 		if niConfig == nil {
 			z.log.Errorf("handleDNSImpl: failed to get config for NI %s", niStatus.UUID)
+			continue
+		}
+		if niStatus.HasError() && !niStatus.WaitingForUplink {
+			// Skip NI if it is in a failed state and the error is not about missing uplink.
 			continue
 		}
 		z.doUpdateNIUplink(niStatus.SelectedUplinkLogicalLabel, &niStatus, *niConfig)
@@ -157,7 +167,6 @@ func (z *zedrouter) handleNetworkInstanceCreate(ctxArg interface{}, key string,
 		NetworkInstanceConfig: config,
 		NetworkInstanceInfo: types.NetworkInstanceInfo{
 			IPAssignments: make(map[string]types.AssignedAddrs),
-			VifMetricMap:  make(map[string]types.NetworkMetric),
 			VlanMap:       make(map[uint32]uint32),
 		},
 	}
@@ -176,11 +185,19 @@ func (z *zedrouter) handleNetworkInstanceCreate(ctxArg interface{}, key string,
 		return
 	}
 
-	if niConflict, err := z.doNetworkInstanceSanityCheck(&config); err != nil {
+	if err := z.doNetworkInstanceSanityCheck(&config); err != nil {
 		z.log.Error(err)
 		status.SetErrorNow(err.Error())
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
-		status.NIConflict = niConflict
+		z.publishNetworkInstanceStatus(&status)
+		return
+	}
+
+	if err := z.checkNetworkInstanceIPConflicts(&config); err != nil {
+		z.log.Error(err)
+		status.SetErrorNow(err.Error())
+		status.ChangeInProgress = types.ChangeInProgressTypeNone
+		status.IPConflict = true
 		z.publishNetworkInstanceStatus(&status)
 		return
 	}
@@ -296,15 +313,25 @@ func (z *zedrouter) handleNetworkInstanceModify(ctxArg interface{}, key string,
 
 	prevPortLL := status.PortLogicalLabel
 	status.NetworkInstanceConfig = config
-	if niConflict, err := z.doNetworkInstanceSanityCheck(&config); err != nil {
+	if err := z.doNetworkInstanceSanityCheck(&config); err != nil {
 		z.log.Error(err)
 		status.SetErrorNow(err.Error())
 		status.WaitingForUplink = false
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
-		status.NIConflict = niConflict
 		z.publishNetworkInstanceStatus(status)
 		return
 	}
+
+	if err := z.checkNetworkInstanceIPConflicts(&config); err != nil {
+		z.log.Error(err)
+		status.SetErrorNow(err.Error())
+		status.IPConflict = true
+		status.WaitingForUplink = false
+		status.ChangeInProgress = types.ChangeInProgressTypeNone
+		z.publishNetworkInstanceStatus(status)
+		return
+	}
+	status.IPConflict = false
 
 	// Get or (less likely) allocate a bridge number.
 	bridgeNumKey := types.UuidToNumKey{UUID: status.UUID}
@@ -394,8 +421,8 @@ func (z *zedrouter) handleNetworkInstanceModify(ctxArg interface{}, key string,
 		z.doUpdateActivatedNetworkInstance(config, status)
 	}
 
-	// Check if some inter-NI conflicts were resolved by this modification.
-	z.checkConflictingNetworkInstances()
+	// Check if some IP conflicts were resolved by this modification.
+	z.checkAllNetworkInstanceIPConflicts()
 	z.log.Functionf("handleNetworkInstanceModify(%s) done", key)
 }
 
@@ -412,8 +439,8 @@ func (z *zedrouter) handleNetworkInstanceDelete(ctxArg interface{}, key string,
 	z.publishNetworkInstanceStatus(status)
 
 	done := z.maybeDelOrInactivateNetworkInstance(status)
-	// Check if some inter-NI conflicts were resolved by this delete.
-	z.checkConflictingNetworkInstances()
+	// Check if some IP conflicts were resolved by this NI deletion.
+	z.checkAllNetworkInstanceIPConflicts()
 	z.log.Functionf("handleNetworkInstanceDelete(%s) done %t", key, done)
 }
 
@@ -468,6 +495,30 @@ func (z *zedrouter) handleAppNetworkCreate(ctxArg interface{}, key string,
 		return
 	}
 	status.AppNum = appNum
+
+	// For app already deployed (before node reboot), keep using the same MAC address
+	// generator. Changing MAC addresses could break network config inside the app.
+	macGenerator, _, err := z.appMACGeneratorMap.Get(appNumKey)
+	if err != nil || macGenerator == types.MACGeneratorUnspecified {
+		// New app or an existing app but without MAC generator ID persisted.
+		if z.localLegacyMACAddr {
+			// Use older node-scoped MAC address generator.
+			macGenerator = types.MACGeneratorNodeScoped
+		} else {
+			// Use newer (and preferred) globally-scoped MAC address generator.
+			macGenerator = types.MACGeneratorGloballyScoped
+		}
+		// Remember which MAC generator is being used for this app.
+		err = z.appMACGeneratorMap.Assign(appNumKey, macGenerator, false)
+		if err != nil {
+			err = fmt.Errorf("failed to persist MAC generator ID for app %s/%s: %v",
+				config.UUIDandVersion.UUID, config.DisplayName, err)
+			z.log.Errorf("handleAppNetworkCreate(%v): %v", config.UUIDandVersion.UUID, err)
+			z.addAppNetworkError(&status, "handleAppNetworkCreate", err)
+			return
+		}
+	}
+	status.MACGenerator = macGenerator
 	z.publishAppNetworkStatus(&status)
 
 	// Allocate application numbers on network instances.
@@ -595,6 +646,12 @@ func (z *zedrouter) handleAppNetworkDelete(ctxArg interface{}, key string,
 			status.UUIDandVersion.UUID, status.DisplayName, err)
 		// Continue anyway...
 	}
+	err = z.appMACGeneratorMap.Delete(appNumKey, false)
+	if err != nil {
+		z.log.Errorf("failed to delete persisted MAC generator ID for app %s/%s: %v",
+			status.UUIDandVersion.UUID, status.DisplayName, err)
+		// Continue anyway...
+	}
 	z.freeAppIntfNums(status)
 
 	// Did this free up any last references against any deleted Network Instance?
@@ -631,9 +688,24 @@ func (z *zedrouter) handleAppInstDelete(ctxArg interface{}, key string,
 }
 
 func (z *zedrouter) handlePatchEnvelopeImpl(peInfo types.PatchEnvelopeInfoList) {
+	before := z.patchEnvelopes.EnvelopesInUsage()
 	z.patchEnvelopes.UpdateEnvelopes(peInfo.Envelopes)
-
 	z.triggerPEUpdate()
+
+	// Delete stale files
+	var after []string
+	for _, pe := range peInfo.Envelopes {
+		peUsages := types.PatchEnvelopeUsageFromInfo(pe)
+		for _, usage := range peUsages {
+			after = append(after, usage.Key())
+		}
+	}
+
+	toDelete, _ := generics.DiffSets(before, after)
+	for _, uuid := range toDelete {
+		z.patchEnvelopesUsage.Delete(uuid)
+		z.peUsagePersist.Delete(uuid)
+	}
 }
 
 func (z *zedrouter) handlePatchEnvelopeCreate(ctxArg interface{}, key string,

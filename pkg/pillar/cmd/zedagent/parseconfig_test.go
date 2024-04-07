@@ -53,7 +53,6 @@ func initGetConfigCtx(g *GomegaWithT) *getconfigContext {
 		zedagentCtx: &zedagentContext{
 			physicalIoAdapterMap: make(map[string]types.PhysicalIOAdapter),
 		},
-		cipherContexts: make(map[string]types.CipherContext),
 	}
 	// cleanup between tests
 	deviceIoListPrevConfigHash = nil
@@ -453,7 +452,7 @@ func TestParseBonds(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "bond-shopfloor",
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor1", "shopfloor0"}, // order matters in Active-Backup mode
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 				Monitoring: &zconfig.BondAdapter_Mii{
@@ -493,7 +492,7 @@ func TestParseBonds(t *testing.T) {
 	g.Expect(port.Logicallabel).To(Equal("adapter-shopfloor"))
 	g.Expect(port.Phylabel).To(BeEmpty())
 	g.Expect(port.IsL3Port).To(BeTrue())
-	g.Expect(port.IfName).To(Equal("bond0"))
+	g.Expect(port.IfName).To(Equal("bond"))
 	g.Expect(port.NetworkUUID.String()).To(Equal(networkUUID))
 	g.Expect(port.Cost).To(BeEquivalentTo(10))
 	g.Expect(port.DhcpConfig.Type).To(BeEquivalentTo(types.NetworkTypeIPv4))
@@ -585,7 +584,7 @@ func TestParseVlansOverBonds(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "bond-shopfloor",
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor1", "shopfloor0"}, // order matters in Active-Backup mode
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 				Monitoring: &zconfig.BondAdapter_Mii{
@@ -678,7 +677,7 @@ func TestParseVlansOverBonds(t *testing.T) {
 	g.Expect(port.Phylabel).To(BeEmpty())
 	g.Expect(port.IsL3Port).To(BeFalse())
 	g.Expect(port.IsMgmt).To(BeFalse())
-	g.Expect(port.IfName).To(Equal("bond0"))
+	g.Expect(port.IfName).To(Equal("bond"))
 	g.Expect(port.NetworkUUID).To(BeZero())
 	g.Expect(port.Cost).To(BeZero())
 	g.Expect(port.DhcpConfig.Type).To(BeEquivalentTo(types.NetworkTypeNOOP))
@@ -819,7 +818,7 @@ func TestInvalidLowerLayerReferences(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "shopfloor", // collides with shopfloor from physicalIO
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor", "warehouse"},
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 			},
@@ -877,7 +876,7 @@ func TestInvalidLowerLayerReferences(t *testing.T) {
 	config.Bonds = []*zconfig.BondAdapter{
 		{
 			Logicallabel:    "bond-shopfloor",
-			InterfaceName:   "bond0",
+			InterfaceName:   "bond",
 			LowerLayerNames: []string{"shopfloor", "warehouse"},
 			BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 		},
@@ -895,7 +894,7 @@ func TestInvalidLowerLayerReferences(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "bond-shopfloor",
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor", "warehouse"},
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 			},
@@ -997,7 +996,7 @@ func TestInvalidLowerLayerReferences(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "bond0",
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor", "warehouse"},
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 			},
@@ -1054,7 +1053,7 @@ func TestInvalidLowerLayerReferences(t *testing.T) {
 		Bonds: []*zconfig.BondAdapter{
 			{
 				Logicallabel:    "bond0",
-				InterfaceName:   "bond0",
+				InterfaceName:   "bond",
 				LowerLayerNames: []string{"shopfloor", "warehouse"},
 				BondMode:        zconfig.BondMode_BOND_MODE_ACTIVE_BACKUP,
 			},
@@ -1326,6 +1325,7 @@ func TestParsePatchEnvelope(t *testing.T) {
 			Name:        displayName,
 			Version:     patchVersion,
 			AllowedApps: []string{appU1, appU2},
+			State:       types.PatchEnvelopeStateActive,
 			BinaryBlobs: []types.BinaryBlobCompleted{
 				{
 					FileName:         inlineFileName,
